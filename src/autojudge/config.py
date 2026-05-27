@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 Provider = Literal["groq", "gemini", "openrouter", "anthropic"]
@@ -71,6 +71,14 @@ class Settings(BaseSettings):
     autojudge_dashboard_basic_auth_pass: str | None = None
     autojudge_intake_basic_auth_user: str | None = None
     autojudge_intake_basic_auth_pass: str | None = None
+
+    @field_validator("autojudge_fallback_provider", mode="before")
+    @classmethod
+    def blank_fallback_provider_is_none(cls, value: object) -> object:
+        """Treat unset/blank env as no fallback (Railway often leaves ``=`` empty)."""
+        if value == "":
+            return None
+        return value
 
     @property
     def submissions_dir(self) -> Path:
