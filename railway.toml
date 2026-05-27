@@ -1,0 +1,56 @@
+# Agrim AutoJudge — Railway configuration template.
+#
+# Railway uses one `railway.toml` per service, so this file is the reference
+# the Agrim infra team copies into each service's Settings → Config. See
+# `DEPLOY.md` for the click-by-click setup instructions.
+#
+# All three services share:
+#   - the same Docker image (built from ./Dockerfile)
+#   - the same Railway volume mounted at /data (snapshot cache + SQLite)
+#   - the same env vars (provider keys, GITHUB_TOKEN, AUTOJUDGE_* knobs)
+#
+# Only the start command differs.
+
+# -----------------------------------------------------------------------------
+# Service: dashboard (Streamlit review UI for human judges)
+# -----------------------------------------------------------------------------
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# Railway substitutes $PORT at runtime. --server.headless=true silences the
+# Streamlit "first run" prompt. Cloudflare Access in front of the public URL
+# enforces auth (see DEPLOY.md).
+startCommand = "streamlit run dashboard/app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true"
+healthcheckPath = "/_stcore/health"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
+
+# -----------------------------------------------------------------------------
+# Service: intake (Streamlit submission form for candidates)
+# Copy this file, change startCommand to:
+#   streamlit run src/autojudge/intake/form.py --server.port=$PORT \
+#     --server.address=0.0.0.0 --server.headless=true
+# Same healthcheckPath. Keep behind Cloudflare Access until the hackathon
+# opens, then flip the Access policy to "bypass for the candidate IP range"
+# or open the URL to the world.
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# Service: worker (run-batch loop + healthz)
+# Copy this file, change [deploy] to:
+#   startCommand = "bash -lc 'autojudge serve-healthz --port 8500 & while true; do autojudge run-batch || true; sleep 60; done'"
+#   healthcheckPath = "/healthz"
+#   healthcheckTimeout = 10
+# Bind the worker's public TCP to the healthz port (8500). The worker has no
+# user-facing UI — Railway only needs the port for the healthcheck.
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# Shared volume — attach to all three services at mountPath = "/data".
+# Configure under Settings → Volumes in the Railway dashboard. Start at 10 GB;
+# snapshot cache + screenshots + SQLite fit comfortably for ~500 submissions.
+# Trigger `autojudge gc` from the worker if usage climbs.
+# -----------------------------------------------------------------------------

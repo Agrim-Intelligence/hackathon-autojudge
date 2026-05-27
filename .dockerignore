@@ -1,0 +1,33 @@
+# Build context hygiene. Everything below either bloats the image or leaks
+# state. The runtime expects `/data` to be a fresh Railway volume.
+.git
+.gitignore
+.github
+.venv
+venv
+env
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.cursor
+.idea
+.vscode
+node_modules
+data
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+.DS_Store
+Thumbs.db
+docs/_build
+*.log
+.env
+.envrc
+.tool-versions
+plans

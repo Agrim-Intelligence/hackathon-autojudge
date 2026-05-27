@@ -1,0 +1,440 @@
+"""Browser verifier: Playwright + LLM driver executing user journeys.
+
+For each journey from the parsed SUBMISSION.md, the agent navigates to the
+live URL and repeatedly:
+1. Snapshots interactive elements on the page
+2. Asks the LLM for the next action
+3. Executes the action
+4. Until success / failure / step budget exhausted
+
+Screenshots are saved per step for evidence. Degrades gracefully if Playwright
+or the live URL is unreachable.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import re
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from ..config import get_settings
+from ..intake.deploy import probe as probe_deploy
+from ..llm import LLMResponse, PromptPart, get_llm
+from ..models import BrowserVerifierReport, InferredJourney, JourneyResult
+
+logger = logging.getLogger(__name__)
+
+
+def _load_prompt() -> str:
+    return (Path(__file__).resolve().parents[3] / "prompts" / "browser_planner.md").read_text(
+        encoding="utf-8"
+    )
+
+
+@dataclass
+class StepRecord:
+    step: int
+    action: dict[str, Any]
+    observation: str
+    screenshot_path: str | None = None
+
+
+@dataclass
+class JourneyRun:
+    journey: InferredJourney
+    records: list[StepRecord] = field(default_factory=list)
+
+
+def verify(
+    live_url: str | None,
+    journeys: list[InferredJourney],
+    submission_id: str,
+    test_credentials: str | None,
+) -> tuple[BrowserVerifierReport, list[LLMResponse]]:
+    settings = get_settings()
+    if not live_url:
+        return (
+            BrowserVerifierReport(
+                live_url_reachable=False,
+                skipped=True,
+                skipped_reason="No live URL provided.",
+                summary_for_scorer="No live URL — browser verification skipped.",
+            ),
+            [],
+        )
+
+    deploy = probe_deploy(live_url, timeout=settings.autojudge_browser_timeout_s)
+    if not deploy.reachable:
+        return (
+            BrowserVerifierReport(
+                live_url_reachable=False,
+                skipped=True,
+                skipped_reason=f"Live URL not reachable: {deploy.error or deploy.status_code}",
+                summary_for_scorer=(
+                    f"Live URL not reachable (status={deploy.status_code} error={deploy.error}); "
+                    "no functional verification possible."
+                ),
+            ),
+            [],
+        )
+
+    if not journeys:
+        return (
+            BrowserVerifierReport(
+                live_url_reachable=True,
+                skipped=True,
+                skipped_reason="No user journeys declared by the candidate.",
+                page_title=deploy.title,
+                summary_for_scorer=(
+                    f"Live URL reachable ({deploy.title or 'no title'}) but no user journeys "
+                    "inferred; cannot evaluate functional correctness end-to-end."
+                ),
+            ),
+            [],
+        )
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return (
+            BrowserVerifierReport(
+                live_url_reachable=True,
+                skipped=True,
+                skipped_reason="Playwright not installed.",
+                page_title=deploy.title,
+                summary_for_scorer="Playwright not installed; browser verification skipped.",
+            ),
+            [],
+        )
+
+    screenshots_dir = settings.submissions_dir / submission_id / "screenshots"
+    screenshots_dir.mkdir(parents=True, exist_ok=True)
+
+    llm = get_llm()
+    system = _load_prompt()
+    journey_results: list[JourneyResult] = []
+    llm_calls: list[LLMResponse] = []
+    console_errors: list[str] = []
+
+    with sync_playwright() as pw:
+        browser = _launch_browser(pw, settings.autojudge_browser_headless)
+        if browser is None:
+            reason = (
+                "Chromium launch failed. Ensure Playwright's bundled Chromium is "
+                "installed via `playwright install chromium`. The full Chromium "
+                "channel is used (channel='chromium') so the headless_shell binary "
+                "is not required."
+            )
+            logger.warning(reason)
+            return (
+                BrowserVerifierReport(
+                    live_url_reachable=True,
+                    skipped=True,
+                    skipped_reason=reason,
+                    page_title=deploy.title,
+                    summary_for_scorer=(
+                        "Browser verification skipped: Chromium binary unavailable on this host. "
+                        "Functional and UX dimensions cannot be observed; treat any web-UI claims "
+                        "as judge-review items rather than verified."
+                    ),
+                ),
+                [],
+            )
+        try:
+            for j_idx, journey in enumerate(journeys):
+                result, calls, errs = _run_journey(
+                    browser=browser,
+                    journey=journey,
+                    j_idx=j_idx,
+                    live_url=live_url,
+                    test_credentials=test_credentials,
+                    screenshots_dir=screenshots_dir,
+                    settings=settings,
+                    llm=llm,
+                    system_prompt=system,
+                )
+                journey_results.append(result)
+                llm_calls.extend(calls)
+                console_errors.extend(errs)
+        finally:
+            browser.close()
+
+    overall_summary = _summarize(journey_results)
+    return (
+        BrowserVerifierReport(
+            live_url_reachable=True,
+            journey_results=journey_results,
+            page_title=deploy.title,
+            notable_console_errors=console_errors[:10],
+            summary=overall_summary,
+            summary_for_scorer=overall_summary,
+        ),
+        llm_calls,
+    )
+
+
+def _run_journey(
+    *,
+    browser,
+    journey: InferredJourney,
+    j_idx: int,
+    live_url: str,
+    test_credentials: str | None,
+    screenshots_dir: Path,
+    settings,
+    llm,
+    system_prompt: str,
+) -> tuple[JourneyResult, list[LLMResponse], list[str]]:
+    records: list[StepRecord] = []
+    calls: list[LLMResponse] = []
+    console_errors: list[str] = []
+
+    context = browser.new_context(
+        viewport={"width": 1280, "height": 800},
+        user_agent="AgrimAutoJudge/0.1 (+https://agrim.ai)",
+    )
+    page = context.new_page()
+    page.on("console", lambda msg: console_errors.append(f"{msg.type}: {msg.text}") if msg.type in {"error", "warning"} else None)
+
+    try:
+        page.goto(live_url, timeout=settings.autojudge_browser_timeout_s * 1000, wait_until="domcontentloaded")
+    except Exception as exc:
+        return (
+            JourneyResult(
+                journey_name=journey.name,
+                success=False,
+                steps_completed=0,
+                total_steps=len(journey.steps),
+                final_observation="",
+                failure_reason=f"navigation failed: {exc}",
+            ),
+            calls,
+            console_errors,
+        )
+
+    success = False
+    final_observation = ""
+    failure_reason: str | None = None
+    screenshots: list[str] = []
+
+    for step in range(settings.autojudge_browser_max_steps):
+        try:
+            elements = _interactive_elements(page)
+        except Exception as exc:
+            failure_reason = f"failed to snapshot page: {exc}"
+            break
+
+        snap = {
+            "url": page.url,
+            "title": page.title(),
+            "elements": elements,
+        }
+        user = (
+            f"### Journey\nName: {journey.name}\nSteps:\n"
+            + "\n".join(f"- {s}" for s in journey.steps)
+            + f"\nExpected outcome: {journey.expected_outcome}\n"
+            + (f"Sample input: {journey.sample_input}\n" if journey.sample_input else "")
+            + (f"Test credentials available: {test_credentials}\n" if test_credentials else "")
+            + "\n### History of actions so far\n"
+            + (
+                "\n".join(
+                    f"step {r.step}: {json.dumps(r.action)} -> {r.observation[:200]}"
+                    for r in records
+                )
+                or "(none yet)"
+            )
+            + "\n\n### Current page state\n"
+            + json.dumps(snap, indent=2)[:6000]
+        )
+
+        try:
+            data, resp = llm.complete_json(
+                system=system_prompt, user=user, tier="reasoning", max_tokens=512
+            )
+            calls.append(resp)
+        except Exception as exc:
+            failure_reason = f"LLM planning failed: {exc}"
+            break
+
+        action = data.get("action", "done")
+        observation = ""
+        screenshot_path: str | None = None
+
+        try:
+            if action == "done":
+                success = bool(data.get("success", False))
+                final_observation = str(data.get("observation", ""))
+                observation = final_observation
+                records.append(StepRecord(step=step, action=data, observation=observation))
+                break
+            if action == "click":
+                _click(page, elements, int(data.get("ref", -1)))
+                observation = f"clicked element ref={data.get('ref')}"
+            elif action == "type":
+                _type(page, elements, int(data.get("ref", -1)), str(data.get("text", "")))
+                observation = f"typed into ref={data.get('ref')}"
+            elif action == "press_enter":
+                ref = data.get("ref")
+                if ref is not None:
+                    _click(page, elements, int(ref))
+                page.keyboard.press("Enter")
+                observation = "pressed Enter"
+            elif action == "goto":
+                page.goto(str(data["url"]), timeout=settings.autojudge_browser_timeout_s * 1000)
+                observation = f"navigated to {data['url']}"
+            elif action == "scroll":
+                direction = data.get("direction", "down")
+                page.mouse.wheel(0, 800 if direction == "down" else -800)
+                observation = f"scrolled {direction}"
+            elif action == "wait":
+                secs = min(5, max(1, int(data.get("seconds", 2))))
+                time.sleep(secs)
+                observation = f"waited {secs}s"
+            else:
+                observation = f"unknown action: {action}"
+            page.wait_for_load_state("networkidle", timeout=4000)
+        except Exception as exc:
+            observation = f"action errored: {exc}"
+
+        screenshot_path = str(screenshots_dir / f"journey{j_idx}_step{step}.png")
+        try:
+            page.screenshot(path=screenshot_path, full_page=False)
+            screenshots.append(screenshot_path)
+        except Exception:
+            screenshot_path = None
+
+        records.append(
+            StepRecord(step=step, action=data, observation=observation, screenshot_path=screenshot_path)
+        )
+
+    else:
+        failure_reason = "step budget exhausted before reaching expected outcome"
+
+    context.close()
+    return (
+        JourneyResult(
+            journey_name=journey.name,
+            success=success,
+            steps_completed=len(records),
+            total_steps=len(journey.steps),
+            final_observation=final_observation,
+            screenshots=screenshots,
+            failure_reason=failure_reason if not success else None,
+        ),
+        calls,
+        console_errors,
+    )
+
+
+def _interactive_elements(page, limit: int = 40) -> list[dict[str, Any]]:
+    """Snapshot interactive elements on the page as a numbered list."""
+    js = """
+    () => {
+      const out = [];
+      const selector = 'a, button, input, textarea, select, [role=button], [role=link], [role=tab], [role=menuitem]';
+      const nodes = Array.from(document.querySelectorAll(selector));
+      let i = 0;
+      for (const el of nodes) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width < 2 || rect.height < 2) continue;
+        const style = window.getComputedStyle(el);
+        if (style.visibility === 'hidden' || style.display === 'none') continue;
+        const tag = el.tagName.toLowerCase();
+        const text = (el.innerText || el.value || el.placeholder || el.ariaLabel || '').trim().slice(0, 80);
+        const type = el.getAttribute('type') || el.getAttribute('role') || tag;
+        out.push({
+          ref: i,
+          tag: tag,
+          type: type,
+          text: text,
+          name: el.getAttribute('name') || null,
+          placeholder: el.getAttribute('placeholder') || null,
+          aria: el.getAttribute('aria-label') || null,
+          href: el.getAttribute('href') || null,
+        });
+        i++;
+        if (i >= """ + str(limit) + """) break;
+      }
+      // Plus visible non-interactive headings to give the LLM context
+      const headings = Array.from(document.querySelectorAll('h1, h2, h3')).slice(0, 6).map(h => ({
+        ref: -1, tag: h.tagName.toLowerCase(), text: (h.innerText || '').trim().slice(0, 120)
+      }));
+      return { interactive: out, headings: headings, bodyText: document.body.innerText.slice(0, 1200) };
+    }
+    """
+    data = page.evaluate(js)
+    return data
+
+
+def _click(page, elements: dict[str, Any], ref: int) -> None:
+    el = _find_ref(elements, ref)
+    selector = _selector_for(el)
+    page.locator(selector).first.click(timeout=4000)
+
+
+def _type(page, elements: dict[str, Any], ref: int, text: str) -> None:
+    el = _find_ref(elements, ref)
+    selector = _selector_for(el)
+    locator = page.locator(selector).first
+    locator.fill(text, timeout=4000)
+
+
+def _find_ref(elements: dict[str, Any], ref: int) -> dict[str, Any]:
+    for el in elements.get("interactive", []):
+        if el["ref"] == ref:
+            return el
+    raise ValueError(f"element ref {ref} not found")
+
+
+def _selector_for(el: dict[str, Any]) -> str:
+    if el.get("name"):
+        return f"{el['tag']}[name='{el['name']}']"
+    if el.get("placeholder"):
+        return f"{el['tag']}[placeholder='{_escape(el['placeholder'])}']"
+    if el.get("aria"):
+        return f"[aria-label='{_escape(el['aria'])}']"
+    if el.get("href"):
+        return f"{el['tag']}[href='{_escape(el['href'])}']"
+    if el.get("text"):
+        text = _escape(el["text"])
+        return f"{el['tag']}:has-text(\"{text[:60]}\")"
+    return el["tag"]
+
+
+def _escape(s: str) -> str:
+    return re.sub(r"['\"]", "", s)
+
+
+def _launch_browser(pw, headless: bool):
+    """Launch Chromium across Playwright binary layouts.
+
+    Playwright >=1.55 splits the headless install into a separate
+    `chromium_headless_shell` binary which is often missing on judge laptops
+    when the install pre-dates the upgrade. We prefer the full Chromium
+    binary (`channel='chromium'`) which is what `playwright install chromium`
+    provisions, and fall back to the default headless shell only if that
+    fails. Operators get a single actionable error from `verify` if both
+    paths fail; we do not raise here.
+    """
+    try:
+        return pw.chromium.launch(channel="chromium", headless=headless)
+    except Exception as exc_channel:
+        logger.info(
+            "Chromium channel='chromium' launch failed (%s); trying default binary",
+            exc_channel,
+        )
+    try:
+        return pw.chromium.launch(headless=headless)
+    except Exception as exc:
+        logger.warning("Default Chromium launch also failed: %s", exc)
+        return None
+
+
+def _summarize(results: list[JourneyResult]) -> str:
+    if not results:
+        return "No journeys executed."
+    n_ok = sum(1 for r in results if r.success)
+    return f"{n_ok}/{len(results)} journeys succeeded."

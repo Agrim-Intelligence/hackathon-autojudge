@@ -1,0 +1,598 @@
+"""Streamlit review dashboard for internal human judges.
+
+Run with:
+    streamlit run dashboard/app.py
+
+Shows a ranked leaderboard with full traces, dimension breakdown with
+provenance badges (stated / inferred / verified / insufficient), a Gaps
+Flagged panel surfacing inferred gaps and insufficient_evidence reasons,
+per-submission cost (precise when provider=anthropic, heuristic otherwise),
+and an active-provider indicator that reads Settings directly.
+
+Judges can record overrides (archetype, verdict, free-form notes) and
+optionally trigger a re-run inline. Overrides are sticky across re-runs and
+captured with auditor identity (Cloudflare Access header when present,
+``USER`` otherwise) so the deliberation trail is preserved.
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+import streamlit as st
+
+from autojudge.auth import current_user, require_basic_auth
+from autojudge.config import get_settings
+from autojudge.llm import supports_prompt_caching, supports_tool_calling
+from autojudge.models import Archetype
+from autojudge.rubric.dimensions import DIMENSIONS
+from autojudge.trace.store import get_store
+
+
+VERDICT_CHOICES = ["(no override)", "shortlist", "borderline", "below_threshold", "insufficient"]
+
+
+def _judge_identity() -> str:
+    """Best-effort identity for override audit.
+
+    Resolution order:
+      1. ``st.session_state`` from the basic-auth shim (set when MVP
+         credentials are configured in the env).
+      2. Cloudflare Access header (when fronting Railway in Phase 2).
+      3. ``X-Forwarded-User`` (other reverse-proxy fallbacks).
+      4. Local ``$USER`` for development; ``anonymous`` as a last resort.
+    """
+    auth_user = current_user("dashboard")
+    if auth_user:
+        return auth_user
+    try:
+        headers = st.context.headers
+    except Exception:
+        headers = {}
+    for key in (
+        "Cf-Access-Authenticated-User-Email",
+        "cf-access-authenticated-user-email",
+        "X-Forwarded-User",
+        "x-forwarded-user",
+    ):
+        value = headers.get(key) if hasattr(headers, "get") else None
+        if value:
+            return value
+    return os.environ.get("USER") or "anonymous"
+
+
+# Auth gate (no-op when AUTOJUDGE_DASHBOARD_BASIC_AUTH_USER / _PASS are unset).
+# Must run before any other page rendering so the login form is what the
+# unauthenticated visitor sees first.
+require_basic_auth("dashboard")
+
+st.set_page_config(page_title="Agrim AutoJudge — Review", layout="wide")
+store = get_store()
+settings = get_settings()
+
+
+PROVENANCE_BADGE = {
+    "stated": ":green[stated]",
+    "inferred": ":blue[inferred]",
+    "verified": ":violet[verified]",
+    "insufficient": ":orange[insufficient]",
+    "unknown": ":gray[unknown]",
+}
+
+
+def _fmt_score(v: Any) -> str:
+    if isinstance(v, (int, float)):
+        return f"{v:.2f}"
+    return "—"
+
+
+@st.cache_data(ttl=10)
+def _leaderboard_df(include_anchors: bool) -> pd.DataFrame:
+    rows = store.leaderboard(include_anchors=include_anchors)
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
+def _provider_panel() -> None:
+    primary = settings.autojudge_primary_provider
+    fallback = settings.autojudge_fallback_provider or "(none)"
+    caching = supports_prompt_caching(primary)
+    tools = supports_tool_calling(primary)
+    cols = st.columns(4)
+    cols[0].metric("Primary provider", primary)
+    cols[1].metric("Fallback provider", fallback)
+    cols[2].metric("Prompt caching", "yes" if caching else "no")
+    cols[3].metric("Tool calling", "yes" if tools else "no")
+    if not caching:
+        st.caption(
+            "Cost figures shown below are **heuristic** for this provider. "
+            "Switch `AUTOJUDGE_PRIMARY_PROVIDER=anthropic` in .env and restart "
+            "the dashboard for precise per-call cost accounting."
+        )
+    else:
+        st.caption(
+            "Anthropic prompt caching active. Cost figures use API-reported "
+            "cache_creation / cache_read token counts."
+        )
+
+
+def render_leaderboard() -> None:
+    st.header("Leaderboard")
+    _provider_panel()
+
+    col1, col2, col3 = st.columns([1, 1, 1])
+    with col1:
+        include_anchors = st.checkbox("Include calibration anchors", value=False)
+    with col2:
+        top_n = st.number_input("Top N", min_value=3, max_value=50, value=10, step=1)
+    with col3:
+        if st.button("Refresh"):
+            _leaderboard_df.clear()
+            st.rerun()
+
+    df = _leaderboard_df(include_anchors)
+    if df.empty:
+        st.info("No submissions yet.")
+        return
+
+    display = df.copy()
+    if "shortlist_rank" in display.columns:
+        display = display.rename(columns={"shortlist_rank": "rank"})
+    else:
+        display["rank"] = range(1, len(display) + 1)
+
+    def _count_review_items(raw: Any) -> int:
+        if not raw:
+            return 0
+        try:
+            return len(json.loads(raw))
+        except Exception:
+            return 0
+
+    if "judge_review_items_json" in display.columns:
+        display["judge_review_items"] = display["judge_review_items_json"].map(_count_review_items)
+    if "verdict_effective" in display.columns:
+        def _decorate(row: pd.Series) -> str:
+            eff = row.get("verdict_effective") or row.get("verdict") or "—"
+            if row.get("verdict_override"):
+                return f"{eff}*"
+            return eff
+
+        display["verdict"] = display.apply(_decorate, axis=1)
+    columns = [
+        "rank",
+        "id",
+        "candidate_name",
+        "team",
+        "archetype",
+        "total_score",
+        "verdict",
+        "judge_review_items",
+        "evaluable_weight",
+        "normalized",
+        "status",
+        "is_anchor",
+    ]
+    display = display[[c for c in columns if c in display.columns]]
+    st.dataframe(display, use_container_width=True, hide_index=True)
+    st.caption(
+        "AutoJudge is a Shortlist Generator. Verdicts are recommendations — "
+        "human judges make the final call on the shortlisted candidates. "
+        "An asterisk (`*`) marks a judge-overridden verdict."
+    )
+
+    top_subset = display.head(top_n)
+    csv = top_subset.to_csv(index=False)
+    st.download_button(
+        "Export top-N as CSV",
+        data=csv,
+        file_name=f"agrim_top{top_n}.csv",
+        mime="text/csv",
+    )
+
+
+def _inference_output_for(submission_id: str) -> dict[str, Any] | None:
+    """Pull the most recent inference run output to surface gaps + summary."""
+    runs = store.get_runs(submission_id)
+    for run in reversed(runs):
+        if run["agent"] == "inference":
+            try:
+                return json.loads(run["output_json"])
+            except Exception:
+                return None
+    return None
+
+
+def render_submission(submission_id: str) -> None:
+    sub = store.get_submission(submission_id)
+    if not sub:
+        st.error(f"Submission {submission_id} not found.")
+        return
+    total = store.get_total(submission_id)
+    scores = store.get_scores(submission_id)
+    runs = store.get_runs(submission_id)
+    cost_info = store.get_submission_cost(submission_id)
+
+    st.subheader(f"{submission_id}")
+    st.caption(
+        f"Candidate: **{sub['candidate_name']}**  |  Team: {sub['team'] or 'solo'}  |  "
+        f"Status: {sub['status']}"
+    )
+
+    cols = st.columns(6)
+    cols[0].metric("Total", _fmt_score(total["total_score"]) if total else "—")
+    auto_verdict = (total or {}).get("verdict") or "—"
+    verdict_override = (total or {}).get("verdict_override")
+    if verdict_override:
+        verdict_label = f"{verdict_override}*"
+        verdict_help = f"Judge override. Auto-judge said: {auto_verdict}."
+    else:
+        verdict_label = auto_verdict
+        verdict_help = "Auto-judge recommendation. No human override."
+    cols[1].metric("Verdict", verdict_label, help=verdict_help)
+    cols[2].metric("Archetype", sub["archetype"])
+    cols[3].metric("Live URL", "yes" if sub["live_url"] else "no")
+    if total:
+        cols[4].metric(
+            "Evaluable weight",
+            f"{total.get('evaluable_weight', 100)}/100",
+        )
+    else:
+        cols[4].metric("Evaluable weight", "—")
+    cost_label = "precise" if cost_info["all_precise"] and cost_info["run_count"] else "heuristic"
+    cols[5].metric(
+        "Cost (USD)",
+        f"${cost_info['total_cost']:.4f}",
+        help=f"{cost_label} — {cost_info['run_count']} verifier runs",
+    )
+
+    if total and total.get("normalized"):
+        st.warning(
+            "Score is normalised over evaluable dimensions only. "
+            "See the 'insufficient' dimensions below for the unscored areas."
+        )
+
+    if total and total.get("integrity_flags_json"):
+        flags = json.loads(total["integrity_flags_json"])
+        if flags:
+            st.warning("Integrity flags:\n" + "\n".join(f"- {f}" for f in flags))
+
+    inference_out = _inference_output_for(submission_id)
+
+    judge_review_panel(total)
+    gaps_panel(total, inference_out)
+
+    if total and total.get("summary"):
+        st.markdown("### Scorer summary")
+        st.write(total["summary"])
+
+    st.markdown("### Artifacts")
+    if sub["repo_url"]:
+        st.write(f"- Repo: {sub['repo_url']}")
+    if sub["live_url"]:
+        st.write(f"- Live URL: {sub['live_url']}")
+    if sub["video_url"]:
+        st.write(f"- Video: {sub['video_url']}")
+    if sub["deck_path"]:
+        st.write(f"- Deck path: `{sub['deck_path']}`")
+
+    st.markdown("### Dimension breakdown")
+    by_id = {s["dimension"]: s for s in scores}
+    for dim in DIMENSIONS:
+        s = by_id.get(dim.id.value)
+        ekind = (s or {}).get("evidence_kind", "inferred")
+        badge = PROVENANCE_BADGE.get(ekind, ekind)
+        if s and s["raw_score"] is not None:
+            header = (
+                f"{dim.name} — {s['raw_score']:.1f}/10 "
+                f"(weighted {s['weighted_score']:.2f}/{dim.base_weight})  {badge}"
+            )
+        else:
+            header = f"{dim.name} — insufficient_evidence  {badge}"
+        with st.expander(header, expanded=False):
+            if not s:
+                st.info("No score recorded.")
+                continue
+            st.write(s["rationale"])
+            if s["cap_applied"]:
+                st.warning(f"Cap applied: {s['cap_reason']}")
+            evidence = json.loads(s["evidence_json"] or "[]")
+            if evidence:
+                st.markdown("**Evidence:**")
+                for e in evidence:
+                    st.write(f"- {e}")
+
+    if inference_out:
+        with st.expander("Inferred submission (provenance trail)", expanded=False):
+            st.json(inference_out, expanded=False)
+
+    st.markdown("### Agent trace")
+    for run in runs:
+        precise_marker = (
+            " (precise)" if run.get("cost_is_precise") else " (heuristic)"
+            if run["cost_usd"] else ""
+        )
+        with st.expander(
+            f"{run['agent']}  ({run['provider'] or '-'}, model={run['model'] or '-'})  "
+            f"started={run['started_at']}",
+            expanded=False,
+        ):
+            st.caption(
+                f"input summary: {run['input_summary']}  |  "
+                f"cost ~${run['cost_usd']:.4f}{precise_marker}"
+                + (f"  |  error: {run['error'][:200]}" if run["error"] else "")
+            )
+            try:
+                payload = json.loads(run["output_json"])
+                st.json(payload, expanded=False)
+            except Exception:
+                st.code(run["output_json"][:5000])
+
+    override_panel(submission_id, sub, total)
+
+    raw_path = json.loads(sub.get("extras_json") or "{}").get("submission_md_path")
+    if raw_path and Path(raw_path).exists():
+        st.markdown("### Free-form context (raw)")
+        st.code(Path(raw_path).read_text(encoding="utf-8")[:20000], language="markdown")
+
+
+def override_panel(
+    submission_id: str,
+    sub: dict[str, Any],
+    total: dict[str, Any] | None,
+) -> None:
+    """Archetype + verdict + judge-notes overrides, with optional inline re-run.
+
+    - Archetype writes to ``submissions.archetype`` (read by the next pipeline
+      run; an explicit re-run is needed to recompute weights).
+    - Verdict override + notes live on ``totals`` and are sticky across
+      re-runs.
+    - Inline re-run spawns ``autojudge run <id>`` as a background process so
+      Streamlit stays responsive. Status polls via the Refresh button.
+    """
+    st.markdown("### Override")
+    judge_identity = _judge_identity()
+    st.caption(f"Acting as: `{judge_identity}` (captured from request headers)")
+
+    current_archetype = sub["archetype"]
+    current_verdict_override = (total or {}).get("verdict_override") or "(no override)"
+    current_notes = (total or {}).get("judge_notes") or ""
+    overridden_by = (total or {}).get("overridden_by")
+    overridden_at = (total or {}).get("overridden_at")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        new_archetype = st.selectbox(
+            "Archetype override",
+            options=[a.value for a in Archetype],
+            index=[a.value for a in Archetype].index(current_archetype),
+            key=f"arch-{submission_id}",
+            help="A re-score is required for the new archetype to change weights.",
+        )
+    with col2:
+        new_verdict = st.selectbox(
+            "Verdict override",
+            options=VERDICT_CHOICES,
+            index=VERDICT_CHOICES.index(current_verdict_override)
+            if current_verdict_override in VERDICT_CHOICES
+            else 0,
+            key=f"verd-{submission_id}",
+            help="Mark shortlist/borderline/below regardless of the auto-score.",
+        )
+    new_notes = st.text_area(
+        "Judge notes",
+        value=current_notes,
+        max_chars=2000,
+        height=120,
+        key=f"notes-{submission_id}",
+        help="Free-form rationale for the override. Surfaced in inspect/export.",
+    )
+
+    if overridden_by:
+        st.caption(
+            f"Last overridden by `{overridden_by}` at {overridden_at or 'unknown'}."
+        )
+
+    btn_save, btn_save_rerun, btn_clear = st.columns([1, 1, 1])
+
+    archetype_changed = new_archetype != current_archetype
+    verdict_value = None if new_verdict == "(no override)" else new_verdict
+    notes_value = new_notes.strip() or None
+    overrides_changed = (
+        verdict_value != ((total or {}).get("verdict_override") or None)
+        or notes_value != ((total or {}).get("judge_notes") or None)
+        or archetype_changed
+    )
+
+    with btn_save:
+        if st.button(
+            "Save overrides",
+            key=f"save-{submission_id}",
+            disabled=not overrides_changed,
+        ):
+            _persist_overrides(
+                submission_id=submission_id,
+                archetype=new_archetype if archetype_changed else None,
+                verdict=verdict_value if verdict_value != ((total or {}).get("verdict_override") or None) else None,
+                notes=notes_value if notes_value != ((total or {}).get("judge_notes") or None) else None,
+                overridden_by=judge_identity if (verdict_value is not None or notes_value is not None) else None,
+                total=total,
+            )
+            _leaderboard_df.clear()
+            st.success("Overrides saved.")
+            st.rerun()
+
+    with btn_save_rerun:
+        if st.button(
+            "Save & re-run",
+            key=f"save-rerun-{submission_id}",
+            type="primary",
+            help="Persist overrides, then trigger a full pipeline re-run for this submission.",
+        ):
+            _persist_overrides(
+                submission_id=submission_id,
+                archetype=new_archetype if archetype_changed else None,
+                verdict=verdict_value if verdict_value != ((total or {}).get("verdict_override") or None) else None,
+                notes=notes_value if notes_value != ((total or {}).get("judge_notes") or None) else None,
+                overridden_by=judge_identity if (verdict_value is not None or notes_value is not None) else None,
+                total=total,
+            )
+            log_path = _spawn_rerun(submission_id)
+            _leaderboard_df.clear()
+            st.info(
+                f"Re-run queued. Tail the worker log at `{log_path}`. "
+                "Status here will update to RUNNING; refresh to track progress."
+            )
+            st.rerun()
+
+    with btn_clear:
+        has_overrides = bool(
+            (total or {}).get("verdict_override")
+            or (total or {}).get("judge_notes")
+            or (total or {}).get("overridden_by")
+        )
+        if st.button(
+            "Clear override",
+            key=f"clear-{submission_id}",
+            disabled=not has_overrides,
+            help="Wipe verdict/notes/auditor. Archetype is not cleared.",
+        ):
+            store.clear_judge_override(submission_id)
+            _leaderboard_df.clear()
+            st.success("Override cleared.")
+            st.rerun()
+
+
+def _persist_overrides(
+    *,
+    submission_id: str,
+    archetype: str | None,
+    verdict: str | None,
+    notes: str | None,
+    overridden_by: str | None,
+    total: dict[str, Any] | None,
+) -> None:
+    """Single entry point so 'Save' and 'Save & re-run' stay in lockstep.
+
+    Passes only the fields that actually changed so the store doesn't bump
+    ``overridden_by`` / ``overridden_at`` on a no-op.
+    """
+    if archetype is None and verdict is None and notes is None:
+        return
+    if total is None and (verdict is not None or notes is not None):
+        st.warning(
+            "Submission has no scored total yet; verdict and notes overrides "
+            "are persisted but won't surface until the pipeline runs at least "
+            "once."
+        )
+    store.set_judge_override(
+        submission_id,
+        archetype=archetype,
+        verdict=verdict if verdict is not None else None,
+        notes=notes if notes is not None else None,
+        overridden_by=overridden_by,
+    )
+
+
+def _spawn_rerun(submission_id: str) -> Path:
+    """Fire-and-forget ``autojudge run <id>`` so Streamlit stays responsive.
+
+    Stdout/stderr go to ``data/submissions/<id>/last_run.log`` so the operator
+    can tail it from the Railway shell.
+    """
+    settings = get_settings()
+    log_dir = settings.submissions_dir / submission_id
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "last_run.log"
+    log_handle = open(log_path, "ab")
+    subprocess.Popen(  # noqa: S603 - controlled args
+        [sys.executable, "-m", "autojudge.cli", "run", submission_id],
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+        cwd=Path.cwd(),
+        close_fds=True,
+    )
+    return log_path
+
+
+def judge_review_panel(total: dict[str, Any] | None) -> None:
+    """Render the judge-review items: claims AutoJudge could not verify.
+
+    These were NOT penalised in the score; they are deferred to the human
+    deliberation meeting. Surfacing them prominently is the central UX move
+    of the Shortlist Generator framing.
+    """
+    if not total or not total.get("judge_review_items_json"):
+        return
+    try:
+        items = json.loads(total["judge_review_items_json"]) or []
+    except Exception:
+        return
+    if not items:
+        return
+    st.markdown(f"### Judge-review items ({len(items)})")
+    st.caption(
+        "These claims were not penalised in the auto-score because AutoJudge "
+        "cannot verify them from the public surface (credentials, third-party "
+        "workspaces, hardware, private integrations). Human judges should "
+        "verify each before the final decision."
+    )
+    for item in items:
+        with st.container(border=True):
+            st.markdown(f"**Claim:** {item.get('claim', '')}")
+            if item.get("reason"):
+                st.write(f"_Why human review:_ {item['reason']}")
+            tag = item.get("source") or item.get("where") or "inferred_submission"
+            st.caption(f"Source: `{tag}`")
+
+
+def gaps_panel(
+    total: dict[str, Any] | None,
+    inference_out: dict[str, Any] | None,
+) -> None:
+    """Combine Inference Agent gaps + insufficient_evidence reasons into one panel."""
+    gaps_inf = (inference_out or {}).get("gaps", []) if inference_out else []
+    flags = []
+    if total and total.get("integrity_flags_json"):
+        flags = json.loads(total["integrity_flags_json"])
+    if not gaps_inf and not flags:
+        return
+    st.markdown("### Gaps flagged")
+    if gaps_inf:
+        st.markdown("**Inference Agent noted these gaps:**")
+        for g in gaps_inf:
+            st.write(f"- {g}")
+    insufficient = [f for f in flags if "insufficient" in f.lower() or "gap" in f.lower()]
+    if insufficient:
+        st.markdown("**Scorer integrity flags relevant to gaps:**")
+        for f in insufficient:
+            st.write(f"- {f}")
+
+
+# --- layout ---
+
+st.title("Agrim AutoJudge")
+st.caption(
+    "Internal judging dashboard. Provider routing is .env-driven; "
+    "edit `.env` and restart this app to change provider."
+)
+
+tab_lb, tab_sub = st.tabs(["Leaderboard", "Submission detail"])
+
+with tab_lb:
+    render_leaderboard()
+
+with tab_sub:
+    df = _leaderboard_df(include_anchors=True)
+    if df.empty:
+        st.info("No submissions yet. Run the pipeline first.")
+    else:
+        selected = st.selectbox("Pick a submission", options=df["id"].tolist())
+        if selected:
+            render_submission(selected)

@@ -1,0 +1,44 @@
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# Secrets / local config (never push)
+.env
+.env.local
+.env.*.local
+
+# Trace store + submission artifacts (machine-local; would explode the repo)
+data/traces.db
+data/traces.db-journal
+data/traces.db.*
+data/submissions/*/raw/
+data/submissions/*/runs/
+data/submissions/*/screenshots/
+data/submissions/*/repo_cache/
+data/submissions/*/last_run.log
+data/top10.json
+data/*.log
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor / agent state (kept out of the repo)
+.cursor/
+.idea/
+.vscode/
+
+# Plans + transcripts live outside the workspace too, but belt-and-braces
+plans/
+*.log
