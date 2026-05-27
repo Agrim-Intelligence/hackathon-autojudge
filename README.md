@@ -42,12 +42,16 @@ autojudge export-top --n 10 --out data/top10.json
 
 ## Deploying
 
-Internal Agrim hackathon ships on Railway with a Cloudflare Access front
-door. The image, env matrix, volume layout, and post-deploy smoke check are
-documented in [`DEPLOY.md`](DEPLOY.md); the Dockerfile and `railway.toml`
-template are committed. Day-to-day operations (redeploys mid-batch, bulk
-re-score, judge overrides, snapshot GC, log tails) live in
-[`RUNBOOK.md`](RUNBOOK.md) under "Operating on Railway".
+**Start here:** [`NEXT_STEPS.md`](NEXT_STEPS.md) — host on Railway, share with
+judges and non-technical team members, day-of checklist.
+
+Internal Agrim hackathon ships on Railway with Streamlit basic auth (MVP) or
+Cloudflare Access (Phase 2). The image, env matrix, volume layout, and
+post-deploy smoke check are documented in [`DEPLOY.md`](DEPLOY.md); the
+Dockerfile and `railway.toml` template are committed. Day-to-day operations
+(redeploys mid-batch, bulk re-score, judge overrides, snapshot GC, log tails)
+live in [`RUNBOOK.md`](RUNBOOK.md) under "Operating on Railway". Judge-facing
+instructions: [`HANDOFF.md`](HANDOFF.md).
 
 ## Provider routing (env-only)
 
