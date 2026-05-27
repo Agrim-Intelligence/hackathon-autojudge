@@ -29,6 +29,9 @@ data/submissions/*/repo_cache/
 data/submissions/*/last_run.log
 data/top10.json
 data/*.log
+data/MVP_CREDENTIALS.txt
+data/calibration*.log
+data/mayank-*.log
 
 # OS junk
 .DS_Store
