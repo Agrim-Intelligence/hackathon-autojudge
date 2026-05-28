@@ -1,23 +1,32 @@
-# Agrim AutoJudge — Railway service reference (v1.2).
+# Agrim AutoJudge — shared Railway config (v1.2).
 #
-# Two services + one Postgres. Per-service configs are NOT merged into a
-# single railway.toml — Railway picks one TOML per service, so each service
-# gets its own file:
+# ONE config for BOTH services. The dashboard and intake services use the same
+# Docker image and the same healthcheck; they differ ONLY by the
+# AUTOJUDGE_ROLE environment variable (dashboard | intake), which scripts/
+# start.sh reads to launch the right Streamlit app.
 #
-#   - railway.dashboard.toml   judges' review UI (Streamlit) + on-demand
-#                              evaluation. Attach a 10 GB volume at /data.
-#   - railway.intake.toml      public candidate submission form (Streamlit).
-#                              No volume required.
+# Topology:
+#   - dashboard service : AUTOJUDGE_ROLE=dashboard, 10 GB volume at /data,
+#                         judges' UI + on-demand "Evaluate" buttons.
+#   - intake service    : AUTOJUDGE_ROLE=intake, no volume, public form.
+#   - Postgres          : shared backing store; both services get
+#                         DATABASE_URL=${{Postgres.DATABASE_URL}}.
 #
-# Both services share env vars and the same Docker image; only the start
-# command and the volume attachment differ. ``DATABASE_URL`` is shared via
-# a Railway Reference Variable to the Postgres plugin so both services see
-# the same backing store.
+# The continuous worker service from v1.1 is gone — evaluation is triggered on
+# demand from the dashboard, which spawns `autojudge run <id>` subprocesses.
 #
-# The continuous worker service from v1.1 has been removed. Evaluation is
-# triggered on demand by the dashboard's "Evaluate selected" button, which
-# spawns one background ``autojudge run <id>`` subprocess per selected
-# submission. The subprocesses run inside the dashboard service.
-#
-# For the click-by-click setup (Railway dashboard) and the one-shot CLI
-# deployment, see ``NEXT_STEPS.md`` and ``scripts/deploy_railway.sh``.
+# One-shot deploy / cleanup: scripts/deploy_railway.sh. Operator runbook:
+# NEXT_STEPS.md.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# No startCommand here on purpose — the Docker CMD (scripts/start.sh) handles
+# it and dispatches on AUTOJUDGE_ROLE. Healthcheck is identical for both
+# Streamlit services.
+healthcheckPath = "/_stcore/health"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5

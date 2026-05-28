@@ -1,24 +1,19 @@
 # Agrim AutoJudge — single image for both Railway services.
 #
-# Both services share the same image; only the start command differs (set in
-# the per-service railway.<service>.toml or via the Railway UI / CLI).
+# Both services share this image and run `scripts/start.sh`, which dispatches
+# on the AUTOJUDGE_ROLE env var:
 #
-#   - dashboard: bash -lc 'streamlit run dashboard/app.py --server.port=$PORT
-#                          --server.address=0.0.0.0 --server.headless=true'
-#                Runs the judges' UI. Background subprocesses spawned by the
-#                "Evaluate selected" button perform the actual AI runs, so the
-#                dashboard service is its own worker (no separate worker
-#                process is required).
-#   - intake:    bash -lc 'streamlit run src/autojudge/intake/form.py
-#                          --server.port=$PORT --server.address=0.0.0.0
-#                          --server.headless=true'
-#                Public candidate-facing form. Writes submissions and deck
-#                blobs into Postgres (DATABASE_URL); reads nothing back.
+#   - AUTOJUDGE_ROLE=dashboard : judges' review UI + on-demand evaluator. The
+#                                "Evaluate" buttons spawn the AI pipeline as
+#                                background subprocesses inside this service,
+#                                so no separate worker process is needed.
+#   - AUTOJUDGE_ROLE=intake    : public candidate submission form. Writes
+#                                submissions + deck blobs to Postgres.
 #
-# Wrap the start command in `bash -lc '...'` so `$PORT` expands at runtime —
-# Railway Dockerfile deploys execute the start command in exec form (no shell
-# expansion), so a bare `$PORT` is passed to Streamlit literally and the
-# healthcheck never receives a response.
+# Using one env var (instead of a per-service start command) keeps the whole
+# deploy scriptable through the Railway CLI, which cannot set a custom start
+# command per service. start.sh expands $PORT at runtime under bash, so the
+# Railway healthcheck gets a real listening port.
 #
 # Playwright Chromium adds ~250 MB but is mandatory for the browser verifier.
 
@@ -75,6 +70,6 @@ EXPOSE 8501
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 
-# Default to the dashboard so `docker run -p 8501:8501 ...` works locally
-# without any extra args. Railway overrides this per service.
-CMD ["bash", "-lc", "streamlit run dashboard/app.py --server.port=${PORT:-8501} --server.address=0.0.0.0 --server.headless=true"]
+# Dispatch on AUTOJUDGE_ROLE (defaults to dashboard). Set AUTOJUDGE_ROLE=intake
+# on the intake service. Local: `docker run -p 8501:8501 -e AUTOJUDGE_ROLE=intake ...`.
+CMD ["bash", "scripts/start.sh"]
