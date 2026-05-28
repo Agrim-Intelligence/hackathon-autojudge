@@ -22,11 +22,7 @@ dockerfilePath = "Dockerfile"
 # Wrap in bash -lc so $PORT expands at runtime. Railway Dockerfile deploys run
 # start commands in exec form (no shell), so a bare $PORT is passed literally
 # to Streamlit and the healthcheck never gets a response.
-startCommand = "bash -lc 'streamlit run dashboard/app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true'"
-healthcheckPath = "/_stcore/health"
-healthcheckTimeout = 30
-restartPolicyType = "ON_FAILURE"
-restartPolicyMaxRetries = 5
+
 
 # -----------------------------------------------------------------------------
 # Service: intake (Streamlit submission form for candidates)
