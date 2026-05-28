@@ -19,10 +19,10 @@ builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-# Railway substitutes $PORT at runtime. --server.headless=true silences the
-# Streamlit "first run" prompt. Cloudflare Access in front of the public URL
-# enforces auth (see DEPLOY.md).
-startCommand = "streamlit run dashboard/app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true"
+# Wrap in bash -lc so $PORT expands at runtime. Railway Dockerfile deploys run
+# start commands in exec form (no shell), so a bare $PORT is passed literally
+# to Streamlit and the healthcheck never gets a response.
+startCommand = "bash -lc 'streamlit run dashboard/app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true'"
 healthcheckPath = "/_stcore/health"
 healthcheckTimeout = 30
 restartPolicyType = "ON_FAILURE"
@@ -31,8 +31,8 @@ restartPolicyMaxRetries = 5
 # -----------------------------------------------------------------------------
 # Service: intake (Streamlit submission form for candidates)
 # Copy this file, change startCommand to:
-#   streamlit run src/autojudge/intake/form.py --server.port=$PORT \
-#     --server.address=0.0.0.0 --server.headless=true
+#   bash -lc 'streamlit run src/autojudge/intake/form.py --server.port=$PORT \
+#     --server.address=0.0.0.0 --server.headless=true'
 # Same healthcheckPath. Keep behind Cloudflare Access until the hackathon
 # opens, then flip the Access policy to "bypass for the candidate IP range"
 # or open the URL to the world.

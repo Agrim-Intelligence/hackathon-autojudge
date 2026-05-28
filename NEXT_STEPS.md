@@ -75,9 +75,9 @@ Dockerfile. Only the **start command** differs.
 
 Already created in Step 1. Set:
 
-- **Settings → Deploy → Start command:**
+- **Settings → Deploy → Start command:** (must use `bash -lc` so `$PORT` expands)
   ```
-  streamlit run dashboard/app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true
+  bash -lc 'streamlit run dashboard/app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true'
   ```
 - **Settings → Deploy → Healthcheck path:** `/_stcore/health`
 - **Settings → Networking → Generate domain** → copy the URL (e.g.
@@ -90,7 +90,7 @@ Already created in Step 1. Set:
 2. Rename service to `intake`.
 3. **Start command:**
    ```
-   streamlit run src/autojudge/intake/form.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true
+   bash -lc 'streamlit run src/autojudge/intake/form.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true'
    ```
 4. **Healthcheck path:** `/_stcore/health`
 5. **Generate domain** → copy URL.
@@ -348,6 +348,7 @@ See [`DEPLOY.md`](DEPLOY.md) Appendix A and Phase 2 section.
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
 | Railway build: `VOLUME at Line … is not supported` | Dockerfile `VOLUME` directive | Remove it; attach Railway Volume at `/data` in dashboard only |
+| Healthcheck fails; logs show `$PORT` as port | Start command not wrapped in shell | Use `bash -lc 'streamlit run … --server.port=$PORT …'` on dashboard + intake |
 | Dashboard asks for login, team can't get in | Wrong password or vars not set on **dashboard** service | Check Railway Variables; reset password in 1Password |
 | Submission stuck on "pending" forever | Worker not running or volume not attached | Check **worker** logs; confirm `/data` volume on all 3 services |
 | All submissions fail at GitHub step | Missing or rate-limited `GITHUB_TOKEN` | Add PAT to Railway Variables; rerun `autojudge doctor` |

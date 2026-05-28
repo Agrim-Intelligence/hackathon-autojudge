@@ -74,8 +74,8 @@ repo → set the start command per the table below. Then attach the
 
 | Service     | Start command                                                                                                                                       | Healthcheck path        | Public? |
 | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------- | ------- |
-| `dashboard` | `streamlit run dashboard/app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true`                                                | `/_stcore/health`       | yes     |
-| `intake`    | `streamlit run src/autojudge/intake/form.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true`                                    | `/_stcore/health`       | yes     |
+| `dashboard` | `bash -lc 'streamlit run dashboard/app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true'`                                   | `/_stcore/health`       | yes     |
+| `intake`    | `bash -lc 'streamlit run src/autojudge/intake/form.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true'`                       | `/_stcore/health`       | yes     |
 | `worker`    | `bash -lc 'autojudge serve-healthz --port 8500 & while true; do autojudge run-batch || true; sleep 60; done'`                                       | `/healthz` on port 8500 | no      |
 
 ### 4. Set environment variables

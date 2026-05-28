@@ -1,8 +1,9 @@
 # Agrim AutoJudge — single image for all three Railway services.
 #
-# Each service overrides the start command in railway.toml:
-#   - dashboard: streamlit run dashboard/app.py --server.port=$PORT --server.address=0.0.0.0
-#   - intake:    streamlit run src/autojudge/intake/form.py --server.port=$PORT --server.address=0.0.0.0
+# Each service overrides the start command in railway.toml (wrap in bash -lc
+# so $PORT expands — Railway exec-form deploys do not expand env vars):
+#   - dashboard: bash -lc 'streamlit run dashboard/app.py --server.port=$PORT ...'
+#   - intake:    bash -lc 'streamlit run src/autojudge/intake/form.py --server.port=$PORT ...'
 #   - worker:    bash -lc 'autojudge serve-healthz --port 8500 & while true; do autojudge run-batch || true; sleep 60; done'
 #
 # Building one image keeps the registry footprint small and guarantees all
