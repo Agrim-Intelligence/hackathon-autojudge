@@ -5,9 +5,9 @@ name: anchor-smoke
 # is editing the repo. The job fails when any anchor's total deviates from
 # its expected score by more than rubric/anchors.MAX_DRIFT.
 #
-# The job needs at least one LLM provider key. We default to Gemini because
-# it has a generous free tier; flip the env block to ANTHROPIC_API_KEY when
-# the Agrim team rotates to paid prod.
+# The job needs at least one LLM provider key. Defaults match the secrets
+# configured on the repo (Anthropic primary, Groq fallback). Override via
+# org/repo Variables AUTOJUDGE_PRIMARY_PROVIDER / AUTOJUDGE_FALLBACK_PROVIDER.
 
 on:
   pull_request:
@@ -27,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      AUTOJUDGE_PRIMARY_PROVIDER: ${{ vars.AUTOJUDGE_PRIMARY_PROVIDER || 'gemini' }}
+      AUTOJUDGE_PRIMARY_PROVIDER: ${{ vars.AUTOJUDGE_PRIMARY_PROVIDER || 'anthropic' }}
       # Must be a valid provider literal or omitted — never ''. An empty org
       # var would otherwise override Settings and fail pydantic validation.
       AUTOJUDGE_FALLBACK_PROVIDER: ${{ vars.AUTOJUDGE_FALLBACK_PROVIDER || 'groq' }}

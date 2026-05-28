@@ -55,9 +55,10 @@ COPY .env.example ./.env.example
 # worker healthz (8500) for local docker-run convenience.
 EXPOSE 8500 8501
 
-# Single shared volume mount point — every service writes here, snapshot
-# cache included. railway.toml mounts a persistent volume at /data.
-VOLUME ["/data"]
+# Persistent data lives at /data (SQLite, snapshot cache, screenshots).
+# Railway: attach a project Volume at mount path /data — do NOT use Dockerfile
+# VOLUME here; Railway's Metal builder rejects it. Local docker run:
+#   docker run -v "$(pwd)/data:/data" ...
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 

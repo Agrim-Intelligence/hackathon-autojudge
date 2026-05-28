@@ -347,6 +347,7 @@ See [`DEPLOY.md`](DEPLOY.md) Appendix A and Phase 2 section.
 
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
+| Railway build: `VOLUME at Line … is not supported` | Dockerfile `VOLUME` directive | Remove it; attach Railway Volume at `/data` in dashboard only |
 | Dashboard asks for login, team can't get in | Wrong password or vars not set on **dashboard** service | Check Railway Variables; reset password in 1Password |
 | Submission stuck on "pending" forever | Worker not running or volume not attached | Check **worker** logs; confirm `/data` volume on all 3 services |
 | All submissions fail at GitHub step | Missing or rate-limited `GITHUB_TOKEN` | Add PAT to Railway Variables; rerun `autojudge doctor` |
