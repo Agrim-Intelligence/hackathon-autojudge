@@ -60,6 +60,8 @@ class Settings(BaseSettings):
     autojudge_data_dir: Path = Path("./data")
     autojudge_db_path: Path = Path("./data/traces.db")
 
+    database_url: str | None = None
+
     autojudge_browser_headless: bool = True
     autojudge_browser_timeout_s: int = 45
     autojudge_browser_max_steps: int = 12
@@ -76,6 +78,14 @@ class Settings(BaseSettings):
     @classmethod
     def blank_fallback_provider_is_none(cls, value: object) -> object:
         """Treat unset/blank env as no fallback (Railway often leaves ``=`` empty)."""
+        if value == "":
+            return None
+        return value
+
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def blank_database_url_is_none(cls, value: object) -> object:
+        """Empty string ``DATABASE_URL`` falls back to SQLite, same as missing."""
         if value == "":
             return None
         return value

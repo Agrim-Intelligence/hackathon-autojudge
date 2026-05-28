@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 import time
 import traceback
 from datetime import datetime, timezone
@@ -182,30 +184,71 @@ def run_submission(submission_id: str) -> None:
         raise ValueError(f"submission {submission_id} not in store")
 
     extras = json.loads(sub_row.get("extras_json") or "{}")
-    submission_md_path = extras.get("submission_md_path")
     test_credentials = extras.get("test_credentials")
-    if not submission_md_path or not Path(submission_md_path).exists():
-        raise FileNotFoundError(f"submission body file missing for {submission_id}")
-    submission_md_raw = Path(submission_md_path).read_text(encoding="utf-8")
+    submission_md_raw = sub_row.get("submission_md_raw")
+    # Backwards-compat: pre-v1.2 rows stored only ``submission_md_path``. Fall
+    # back to reading the file if the inline column is empty AND the path is
+    # reachable on the current container's filesystem.
+    if not submission_md_raw:
+        path = extras.get("submission_md_path")
+        if path and Path(path).exists():
+            submission_md_raw = Path(path).read_text(encoding="utf-8")
+        else:
+            raise FileNotFoundError(
+                f"submission body unavailable for {submission_id}: inline column "
+                "empty and submission_md_path not reachable on this container. "
+                "Re-submit through the intake form so the body is persisted to "
+                "the trace store."
+            )
+
     is_anchor = bool(sub_row.get("is_anchor"))
 
     store.set_status(submission_id, SubmissionStatus.RUNNING)
     logger.info("[%s] pipeline start", submission_id)
 
+    # Materialise the deck blob (if any) to a per-run tmpdir. This lets the
+    # dashboard service evaluate a submission that was uploaded on a separate
+    # intake service with no shared volume — the canonical store of the deck
+    # is the ``submission_blobs`` table in the trace store.
+    deck_workdir: Path | None = None
+    materialised_deck_path: str | None = None
     try:
-        _run_pipeline(
-            store=store,
-            submission_id=submission_id,
-            sub_row=sub_row,
-            submission_md_raw=submission_md_raw,
-            test_credentials=test_credentials,
-            is_anchor=is_anchor,
-        )
-    except Exception as exc:
-        logger.exception("[%s] pipeline failed: %s", submission_id, exc)
-        _record_failure(store, submission_id, "pipeline", exc)
-        store.set_status(submission_id, SubmissionStatus.FAILED)
-        raise
+        if store.has_blob(submission_id, "deck.pdf"):
+            deck_bytes = store.get_blob(submission_id, "deck.pdf")
+            if deck_bytes:
+                deck_workdir = Path(tempfile.mkdtemp(prefix=f"deck-{submission_id}-"))
+                materialised_deck_path = str(deck_workdir / "deck.pdf")
+                Path(materialised_deck_path).write_bytes(deck_bytes)
+                # Make sure the downstream agents see the real on-disk path,
+                # not whatever the intake form happened to write locally.
+                sub_row["deck_path"] = materialised_deck_path
+        elif sub_row.get("deck_path") and not Path(sub_row["deck_path"]).exists():
+            # Path stored on the row but the file isn't present on this
+            # container — null it out so the deck parser cleanly skips.
+            sub_row["deck_path"] = None
+
+        try:
+            _run_pipeline(
+                store=store,
+                submission_id=submission_id,
+                sub_row=sub_row,
+                submission_md_raw=submission_md_raw,
+                test_credentials=test_credentials,
+                is_anchor=is_anchor,
+            )
+        except Exception as exc:
+            logger.exception("[%s] pipeline failed: %s", submission_id, exc)
+            _record_failure(store, submission_id, "pipeline", exc)
+            store.set_status(submission_id, SubmissionStatus.FAILED)
+            raise
+    finally:
+        if deck_workdir is not None:
+            try:
+                if materialised_deck_path:
+                    os.unlink(materialised_deck_path)
+                deck_workdir.rmdir()
+            except OSError:
+                pass
 
 
 class _DeadlineExceeded(Exception):
@@ -588,12 +631,7 @@ def run_anchor(anchor_id: str, anchor_md_path: Path) -> Submission:
 def run_pending_batch() -> list[str]:
     """Run every submission still in pending or failed state."""
     store = get_store()
-    ids: list[str] = []
-    with store.connect() as conn:
-        rows = conn.execute(
-            "SELECT id FROM submissions WHERE status IN ('pending', 'failed') ORDER BY created_at"
-        ).fetchall()
-        ids = [r["id"] for r in rows]
+    ids = store.list_pending_submission_ids()
     for sid in ids:
         try:
             run_submission(sid)

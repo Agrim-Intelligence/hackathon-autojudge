@@ -126,7 +126,7 @@ def render_leaderboard() -> None:
     st.header("Leaderboard")
     _provider_panel()
 
-    col1, col2, col3 = st.columns([1, 1, 1])
+    col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
     with col1:
         include_anchors = st.checkbox("Include calibration anchors", value=False)
     with col2:
@@ -135,6 +135,12 @@ def render_leaderboard() -> None:
         if st.button("Refresh"):
             _leaderboard_df.clear()
             st.rerun()
+    with col4:
+        auto_refresh = st.checkbox(
+            "Auto-refresh while running",
+            value=False,
+            help="Re-render every 5s when any submission is in the RUNNING state.",
+        )
 
     df = _leaderboard_df(include_anchors)
     if df.empty:
@@ -165,7 +171,11 @@ def render_leaderboard() -> None:
             return eff
 
         display["verdict"] = display.apply(_decorate, axis=1)
+
+    # Editable selection column so judges can pick the rows to (re)evaluate.
+    display.insert(0, "select", False)
     columns = [
+        "select",
         "rank",
         "id",
         "candidate_name",
@@ -180,14 +190,41 @@ def render_leaderboard() -> None:
         "is_anchor",
     ]
     display = display[[c for c in columns if c in display.columns]]
-    st.dataframe(display, use_container_width=True, hide_index=True)
+    edited = st.data_editor(
+        display,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "select": st.column_config.CheckboxColumn(
+                "Run",
+                help="Tick to include this submission in 'Evaluate selected'.",
+                default=False,
+            ),
+            "id": st.column_config.TextColumn(disabled=True),
+            "candidate_name": st.column_config.TextColumn(disabled=True),
+            "team": st.column_config.TextColumn(disabled=True),
+            "archetype": st.column_config.TextColumn(disabled=True),
+            "total_score": st.column_config.NumberColumn(disabled=True),
+            "verdict": st.column_config.TextColumn(disabled=True),
+            "judge_review_items": st.column_config.NumberColumn(disabled=True),
+            "evaluable_weight": st.column_config.NumberColumn(disabled=True),
+            "normalized": st.column_config.NumberColumn(disabled=True),
+            "status": st.column_config.TextColumn(disabled=True),
+            "is_anchor": st.column_config.CheckboxColumn(disabled=True),
+            "rank": st.column_config.NumberColumn(disabled=True),
+        },
+        key="leaderboard_editor",
+    )
+    selected_ids = edited.loc[edited["select"] == True, "id"].tolist()  # noqa: E712
     st.caption(
         "AutoJudge is a Shortlist Generator. Verdicts are recommendations — "
         "human judges make the final call on the shortlisted candidates. "
         "An asterisk (`*`) marks a judge-overridden verdict."
     )
 
-    top_subset = display.head(top_n)
+    _evaluate_panel(selected_ids, all_ids=edited["id"].tolist())
+
+    top_subset = edited.drop(columns=["select"]).head(top_n)
     csv = top_subset.to_csv(index=False)
     st.download_button(
         "Export top-N as CSV",
@@ -195,6 +232,119 @@ def render_leaderboard() -> None:
         file_name=f"agrim_top{top_n}.csv",
         mime="text/csv",
     )
+
+    if auto_refresh and any(
+        (s or "").lower() == "running" for s in edited["status"].tolist()
+    ):
+        import time as _time
+
+        _time.sleep(5)
+        _leaderboard_df.clear()
+        st.rerun()
+
+
+def _evaluate_panel(selected_ids: list[str], *, all_ids: list[str]) -> None:
+    """Render the 'Evaluate selected' UI directly under the leaderboard.
+
+    Selected ids → spawn one background subprocess per submission (the worker
+    is the same ``autojudge run <id>`` invocation the override panel uses, so
+    behaviour is identical for re-runs). Postgres status reflects RUNNING /
+    SCORED / FAILED back to the table. ``Refresh`` or auto-refresh re-renders.
+    """
+    st.markdown("### Run evaluations")
+    if not all_ids:
+        st.info("Nothing to evaluate yet.")
+        return
+
+    btn_cols = st.columns([2, 2, 2, 4])
+    with btn_cols[0]:
+        run_selected = st.button(
+            f"Evaluate selected ({len(selected_ids)})",
+            type="primary",
+            disabled=not selected_ids,
+            help="Re-run the AI pipeline on every ticked row.",
+            key="evaluate_selected_btn",
+        )
+    with btn_cols[1]:
+        pending_ids = [
+            sid for sid in get_store().list_pending_submission_ids()
+            if sid in all_ids
+        ]
+        run_pending = st.button(
+            f"Evaluate all pending ({len(pending_ids)})",
+            disabled=not pending_ids,
+            help="Run every submission whose status is `pending` or `failed`.",
+            key="evaluate_pending_btn",
+        )
+    with btn_cols[2]:
+        run_all = st.button(
+            f"Evaluate all ({len(all_ids)})",
+            help=(
+                "Full re-score for every submission shown — useful after "
+                "you change weights, rubric anchors, or judge overrides."
+            ),
+            key="evaluate_all_btn",
+        )
+    with btn_cols[3]:
+        st.caption(
+            "Each submission runs in the background on this dashboard "
+            "service. Watch the **status** column update; the row turns "
+            "`running` while the agents are working and `scored`/`failed` "
+            "when done."
+        )
+
+    ids_to_run: list[str] = []
+    if run_selected:
+        ids_to_run = list(selected_ids)
+    elif run_pending:
+        ids_to_run = pending_ids
+    elif run_all:
+        ids_to_run = list(all_ids)
+
+    if not ids_to_run:
+        return
+
+    started, skipped = _launch_evaluations(ids_to_run)
+    if started:
+        st.success(
+            f"Queued {len(started)} evaluation(s). Refresh (or tick "
+            "auto-refresh) to track progress."
+        )
+        with st.expander("Queued submissions", expanded=False):
+            for sid in started:
+                st.write(f"- `{sid}`")
+    if skipped:
+        st.warning(
+            f"Skipped {len(skipped)} submission(s) already in `running` state:\n"
+            + "\n".join(f"- `{sid}`" for sid in skipped)
+        )
+    _leaderboard_df.clear()
+
+
+def _launch_evaluations(submission_ids: list[str]) -> tuple[list[str], list[str]]:
+    """Spawn one ``autojudge run <id>`` subprocess per id, skipping RUNNING rows.
+
+    Returns ``(started, skipped)``. The subprocess approach mirrors the
+    existing ``Save & re-run`` button — robust to Streamlit auto-reloads,
+    and the only thing the dashboard needs to do afterwards is poll the
+    store for status changes.
+    """
+    store = get_store()
+    started: list[str] = []
+    skipped: list[str] = []
+    for sid in submission_ids:
+        sub = store.get_submission(sid)
+        if not sub:
+            continue
+        if (sub.get("status") or "").lower() == "running":
+            skipped.append(sid)
+            continue
+        try:
+            _spawn_rerun(sid)
+            started.append(sid)
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Failed to launch `{sid}`: {exc}")
+    return started, skipped
 
 
 def _inference_output_for(submission_id: str) -> dict[str, Any] | None:

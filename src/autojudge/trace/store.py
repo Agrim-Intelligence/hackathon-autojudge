@@ -1,13 +1,19 @@
-"""SQLite-backed trace store for submissions, verifier runs, and scores.
+"""Trace store backends for submissions, verifier runs, scores, and blobs.
 
-Synchronous SQLite is fine for v1.0 — we run one batch at a time and the
-dashboard is read-only. Threadlocal connection keeps it simple.
+Two interchangeable implementations live behind ``TraceStoreProtocol``:
 
-The concrete `TraceStore` class is the default implementation. The
-`TraceStoreProtocol` below describes the narrow surface every backend must
-satisfy. Phase 2 of the all-India plan swaps SQLite for Postgres for
-concurrent batches; the protocol exists so that swap is mechanical (no
-caller-side changes) rather than another rewrite.
+- ``TraceStore`` (SQLite): local dev default. Uses a file under
+  ``AUTOJUDGE_DB_PATH``. Threadlocal connections keep the synchronous path
+  simple. Suitable for single-process / single-machine runs.
+
+- ``PostgresTraceStore`` (Postgres): Railway-deployment default once
+  ``DATABASE_URL`` is set. Required for multi-service topologies (intake +
+  dashboard talking to the same data) because Railway volumes are not
+  shareable across services. Uses a small connection pool so concurrent
+  evaluations don't serialise on one socket.
+
+``get_store()`` picks the backend based on ``DATABASE_URL``. Callers never
+import the backend class directly.
 """
 from __future__ import annotations
 
@@ -28,7 +34,7 @@ from ..models import (
     SubmissionStatus,
     VerifierRun,
 )
-from .schema import MIGRATIONS, SCHEMA, SCORES_REBUILD
+from .schema import MIGRATIONS_SQLITE, SCHEMA_SQLITE, SCORES_REBUILD_SQLITE
 
 logger = logging.getLogger(__name__)
 _local = threading.local()
@@ -44,14 +50,11 @@ class TraceStoreProtocol(Protocol):
 
     Kept intentionally minimal: writes are idempotent, reads return plain
     dictionaries (no ORM rows), and no caller needs to know about the
-    backing engine. The SQLite implementation below is the v1.x default;
-    a Postgres implementation in Phase 2 swaps in without changes to
-    agents, orchestrator, CLI, or dashboard.
+    backing engine. Both SQLite and Postgres implementations conform.
 
-    The protocol omits the SQLite-specific `connect()` context manager; the
-    Postgres backend will expose its own equivalent if internal call sites
-    need raw transactional access. New backends MUST keep the public methods
-    listed here bytewise compatible.
+    Backend-specific transactional access (``connect()`` on SQLite, the
+    psycopg pool on Postgres) is intentionally NOT in the protocol — call
+    sites that need raw SQL go through the typed helpers below.
     """
 
     def upsert_submission(self, sub: Submission) -> None: ...
@@ -96,6 +99,22 @@ class TraceStoreProtocol(Protocol):
 
     def list_submission_ids(self, include_anchors: bool = True) -> list[str]: ...
 
+    def list_pending_submission_ids(self) -> list[str]: ...
+
+    def put_blob(
+        self,
+        submission_id: str,
+        name: str,
+        data: bytes,
+        content_type: str | None = None,
+    ) -> None: ...
+
+    def get_blob(self, submission_id: str, name: str) -> bytes | None: ...
+
+    def has_blob(self, submission_id: str, name: str) -> bool: ...
+
+    def backend_name(self) -> str: ...
+
 
 class TraceStore:
     def __init__(self, db_path: Path | None = None) -> None:
@@ -103,8 +122,8 @@ class TraceStore:
         self.db_path = Path(db_path or settings.autojudge_db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as conn:
-            conn.executescript(SCHEMA)
-            for stmt in MIGRATIONS:
+            conn.executescript(SCHEMA_SQLITE)
+            for stmt in MIGRATIONS_SQLITE:
                 try:
                     conn.execute(stmt)
                 except sqlite3.OperationalError:
@@ -112,6 +131,9 @@ class TraceStore:
             self._rebuild_scores_if_legacy(conn)
             conn.commit()
         self.reset_stale_running()
+
+    def backend_name(self) -> str:
+        return "sqlite"
 
     def _rebuild_scores_if_legacy(self, conn: sqlite3.Connection) -> None:
         """Drop legacy NOT NULL constraints on scores.raw_score / weighted_score.
@@ -130,7 +152,7 @@ class TraceStore:
         if not legacy:
             return
         logger.warning("Migrating legacy `scores` table to v1.0 nullable schema")
-        conn.executescript(SCORES_REBUILD)
+        conn.executescript(SCORES_REBUILD_SQLITE)
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -152,8 +174,9 @@ class TraceStore:
                 INSERT INTO submissions (
                     id, candidate_name, candidate_email, team,
                     repo_url, live_url, video_url, deck_path,
-                    archetype, status, is_anchor, created_at, extras_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    archetype, status, is_anchor, created_at, extras_json,
+                    submission_md_raw
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     candidate_name = excluded.candidate_name,
                     candidate_email = excluded.candidate_email,
@@ -165,7 +188,8 @@ class TraceStore:
                     archetype = excluded.archetype,
                     status = excluded.status,
                     is_anchor = excluded.is_anchor,
-                    extras_json = excluded.extras_json
+                    extras_json = excluded.extras_json,
+                    submission_md_raw = excluded.submission_md_raw
                 """,
                 (
                     sub.id,
@@ -186,6 +210,7 @@ class TraceStore:
                             "test_credentials": sub.artifacts.test_credentials,
                         }
                     ),
+                    sub.submission_md_raw,
                 ),
             )
             conn.commit()
@@ -317,8 +342,55 @@ class TraceStore:
             conn.execute("DELETE FROM totals WHERE submission_id = ?", (submission_id,))
             conn.execute("DELETE FROM scores WHERE submission_id = ?", (submission_id,))
             conn.execute("DELETE FROM verifier_runs WHERE submission_id = ?", (submission_id,))
+            conn.execute("DELETE FROM submission_blobs WHERE submission_id = ?", (submission_id,))
             conn.execute("DELETE FROM submissions WHERE id = ?", (submission_id,))
             conn.commit()
+
+    def put_blob(
+        self,
+        submission_id: str,
+        name: str,
+        data: bytes,
+        content_type: str | None = None,
+    ) -> None:
+        """Upsert a binary attachment for a submission (e.g. deck PDF).
+
+        Replaces any prior blob with the same ``(submission_id, name)``. The
+        intake form is the canonical writer; the orchestrator materialises
+        blobs back to ``/tmp`` per-evaluation.
+        """
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO submission_blobs (
+                    submission_id, name, content_type, data, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(submission_id, name) DO UPDATE SET
+                    content_type = excluded.content_type,
+                    data = excluded.data,
+                    created_at = excluded.created_at
+                """,
+                (submission_id, name, content_type, data, _now_iso()),
+            )
+            conn.commit()
+
+    def get_blob(self, submission_id: str, name: str) -> bytes | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT data FROM submission_blobs WHERE submission_id = ? AND name = ?",
+                (submission_id, name),
+            ).fetchone()
+            if row is None:
+                return None
+            return bytes(row["data"])
+
+    def has_blob(self, submission_id: str, name: str) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM submission_blobs WHERE submission_id = ? AND name = ?",
+                (submission_id, name),
+            ).fetchone()
+            return row is not None
 
     def record_run(self, run: VerifierRun) -> int:
         with self.connect() as conn:
@@ -530,6 +602,14 @@ class TraceStore:
             sql += " ORDER BY created_at"
             return [r["id"] for r in conn.execute(sql).fetchall()]
 
+    def list_pending_submission_ids(self) -> list[str]:
+        """Submissions still pending or previously failed, oldest first."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM submissions WHERE status IN ('pending', 'failed') ORDER BY created_at"
+            ).fetchall()
+            return [r["id"] for r in rows]
+
 
 _store: TraceStoreProtocol | None = None
 
@@ -537,12 +617,22 @@ _store: TraceStoreProtocol | None = None
 def get_store() -> TraceStoreProtocol:
     """Return the active trace store backend.
 
-    v1.x default is `TraceStore` (SQLite). Phase 2 will inject a Postgres
-    implementation here based on an env var; nothing else needs to change.
+    Picks Postgres when ``DATABASE_URL`` is set in the environment, else
+    falls back to SQLite at ``AUTOJUDGE_DB_PATH``. The choice is made on
+    first call and memoised for the lifetime of the process.
     """
     global _store
     if _store is None:
-        _store = TraceStore()
+        settings = get_settings()
+        if settings.database_url:
+            # Local import keeps psycopg out of the SQLite-only code paths.
+            from .postgres_store import PostgresTraceStore
+
+            logger.info("Trace store backend: postgres")
+            _store = PostgresTraceStore(settings.database_url)
+        else:
+            logger.info("Trace store backend: sqlite at %s", settings.autojudge_db_path)
+            _store = TraceStore()
     return _store
 
 

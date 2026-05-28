@@ -1,52 +1,23 @@
-# Agrim AutoJudge — Railway configuration template.
+# Agrim AutoJudge — Railway service reference (v1.2).
 #
-# Railway uses one `railway.toml` per service, so this file is the reference
-# the Agrim infra team copies into each service's Settings → Config. See
-# `DEPLOY.md` for the click-by-click setup instructions.
+# Two services + one Postgres. Per-service configs are NOT merged into a
+# single railway.toml — Railway picks one TOML per service, so each service
+# gets its own file:
 #
-# All three services share:
-#   - the same Docker image (built from ./Dockerfile)
-#   - the same Railway volume mounted at /data (snapshot cache + SQLite)
-#   - the same env vars (provider keys, GITHUB_TOKEN, AUTOJUDGE_* knobs)
+#   - railway.dashboard.toml   judges' review UI (Streamlit) + on-demand
+#                              evaluation. Attach a 10 GB volume at /data.
+#   - railway.intake.toml      public candidate submission form (Streamlit).
+#                              No volume required.
 #
-# Only the start command differs.
-
-# -----------------------------------------------------------------------------
-# Service: dashboard (Streamlit review UI for human judges)
-# -----------------------------------------------------------------------------
-[build]
-builder = "DOCKERFILE"
-dockerfilePath = "Dockerfile"
-
-[deploy]
-# Wrap in bash -lc so $PORT expands at runtime. Railway Dockerfile deploys run
-# start commands in exec form (no shell), so a bare $PORT is passed literally
-# to Streamlit and the healthcheck never gets a response.
-
-
-# -----------------------------------------------------------------------------
-# Service: intake (Streamlit submission form for candidates)
-# Copy this file, change startCommand to:
-#   bash -lc 'streamlit run src/autojudge/intake/form.py --server.port=$PORT \
-#     --server.address=0.0.0.0 --server.headless=true'
-# Same healthcheckPath. Keep behind Cloudflare Access until the hackathon
-# opens, then flip the Access policy to "bypass for the candidate IP range"
-# or open the URL to the world.
-# -----------------------------------------------------------------------------
-
-# -----------------------------------------------------------------------------
-# Service: worker (run-batch loop + healthz)
-# Copy this file, change [deploy] to:
-#   startCommand = "bash -lc 'autojudge serve-healthz --port 8500 & while true; do autojudge run-batch || true; sleep 60; done'"
-#   healthcheckPath = "/healthz"
-#   healthcheckTimeout = 10
-# Bind the worker's public TCP to the healthz port (8500). The worker has no
-# user-facing UI — Railway only needs the port for the healthcheck.
-# -----------------------------------------------------------------------------
-
-# -----------------------------------------------------------------------------
-# Shared volume — attach to all three services at mountPath = "/data".
-# Configure under Settings → Volumes in the Railway dashboard. Start at 10 GB;
-# snapshot cache + screenshots + SQLite fit comfortably for ~500 submissions.
-# Trigger `autojudge gc` from the worker if usage climbs.
-# -----------------------------------------------------------------------------
+# Both services share env vars and the same Docker image; only the start
+# command and the volume attachment differ. ``DATABASE_URL`` is shared via
+# a Railway Reference Variable to the Postgres plugin so both services see
+# the same backing store.
+#
+# The continuous worker service from v1.1 has been removed. Evaluation is
+# triggered on demand by the dashboard's "Evaluate selected" button, which
+# spawns one background ``autojudge run <id>`` subprocess per selected
+# submission. The subprocesses run inside the dashboard service.
+#
+# For the click-by-click setup (Railway dashboard) and the one-shot CLI
+# deployment, see ``NEXT_STEPS.md`` and ``scripts/deploy_railway.sh``.

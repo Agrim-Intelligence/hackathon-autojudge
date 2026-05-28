@@ -1,14 +1,26 @@
-# Agrim AutoJudge — single image for all three Railway services.
+# Agrim AutoJudge — single image for both Railway services.
 #
-# Each service overrides the start command in railway.toml (wrap in bash -lc
-# so $PORT expands — Railway exec-form deploys do not expand env vars):
-#   - dashboard: bash -lc 'streamlit run dashboard/app.py --server.port=$PORT ...'
-#   - intake:    bash -lc 'streamlit run src/autojudge/intake/form.py --server.port=$PORT ...'
-#   - worker:    bash -lc 'autojudge serve-healthz --port 8500 & while true; do autojudge run-batch || true; sleep 60; done'
+# Both services share the same image; only the start command differs (set in
+# the per-service railway.<service>.toml or via the Railway UI / CLI).
 #
-# Building one image keeps the registry footprint small and guarantees all
-# three services run identical code. Playwright Chromium adds ~250 MB but is
-# unavoidable for the browser verifier.
+#   - dashboard: bash -lc 'streamlit run dashboard/app.py --server.port=$PORT
+#                          --server.address=0.0.0.0 --server.headless=true'
+#                Runs the judges' UI. Background subprocesses spawned by the
+#                "Evaluate selected" button perform the actual AI runs, so the
+#                dashboard service is its own worker (no separate worker
+#                process is required).
+#   - intake:    bash -lc 'streamlit run src/autojudge/intake/form.py
+#                          --server.port=$PORT --server.address=0.0.0.0
+#                          --server.headless=true'
+#                Public candidate-facing form. Writes submissions and deck
+#                blobs into Postgres (DATABASE_URL); reads nothing back.
+#
+# Wrap the start command in `bash -lc '...'` so `$PORT` expands at runtime —
+# Railway Dockerfile deploys execute the start command in exec form (no shell
+# expansion), so a bare `$PORT` is passed to Streamlit literally and the
+# healthcheck never receives a response.
+#
+# Playwright Chromium adds ~250 MB but is mandatory for the browser verifier.
 
 FROM python:3.12-slim AS base
 
@@ -52,14 +64,14 @@ COPY anchors ./anchors
 COPY scripts ./scripts
 COPY .env.example ./.env.example
 
-# Railway provides $PORT at runtime; expose both Streamlit (8501) and the
-# worker healthz (8500) for local docker-run convenience.
-EXPOSE 8500 8501
+EXPOSE 8501
 
-# Persistent data lives at /data (SQLite, snapshot cache, screenshots).
-# Railway: attach a project Volume at mount path /data — do NOT use Dockerfile
-# VOLUME here; Railway's Metal builder rejects it. Local docker run:
-#   docker run -v "$(pwd)/data:/data" ...
+# /data is used by the dashboard service for repo-snapshot cache, screenshots,
+# and submission scratch files during evaluation. Postgres is the source of
+# truth for submission rows + scores + deck blobs, so the intake service can
+# run with NO volume mounted at all. On Railway: attach a volume at /data on
+# the dashboard service only; do NOT use a Dockerfile `VOLUME` directive
+# (Railway's Metal builder rejects it).
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 

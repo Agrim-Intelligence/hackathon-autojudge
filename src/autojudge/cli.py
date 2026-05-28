@@ -87,9 +87,11 @@ def ingest_flexible(
     target_md.write_text(body + "\n", encoding="utf-8")
 
     target_deck: str | None = None
+    deck_bytes: bytes | None = None
     if deck_path:
+        deck_bytes = deck_path.read_bytes()
         target_deck = str(sub_dir / "deck.pdf")
-        Path(target_deck).write_bytes(deck_path.read_bytes())
+        Path(target_deck).write_bytes(deck_bytes)
 
     submission = Submission(
         id=sub_id,
@@ -106,6 +108,8 @@ def ingest_flexible(
         status=SubmissionStatus.PENDING,
     )
     store.upsert_submission(submission)
+    if deck_bytes is not None:
+        store.put_blob(sub_id, "deck.pdf", deck_bytes, content_type="application/pdf")
     console.print(f"[green]Registered submission[/green] {sub_id}")
 
 
@@ -546,6 +550,17 @@ def doctor() -> None:
     drift_report = _anchor_drift_summary()
     if drift_report:
         console.print(drift_report)
+
+    # --- Trace store backend (printed regardless of failures so the operator
+    # can confirm Postgres took effect even if other probes complain). ---
+    backend = get_store().backend_name()
+    console.print(f"[bold cyan]Trace store backend:[/bold cyan] {backend}")
+    if backend == "sqlite" and settings.database_url:
+        warnings.append(
+            "DATABASE_URL is set but the store is still SQLite — likely a "
+            "Pydantic parsing issue or the env var was not exported. "
+            "Re-export and restart the service."
+        )
 
     for w in warnings:
         console.print(f"[yellow]warning[/yellow] {w}")

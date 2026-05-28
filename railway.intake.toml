@@ -1,0 +1,24 @@
+# Railway service config — intake (public candidate submission form).
+#
+# Apply via the Railway CLI (see scripts/deploy_railway.sh) or paste under
+# Settings → Service → Config in the Railway dashboard.
+#
+# This service is filesystem-free: every submission body and deck PDF is
+# persisted to Postgres directly. NO Railway volume is required.
+#
+# Required env vars (set on this service in Railway):
+#   DATABASE_URL                         (shared with dashboard — Reference Variable)
+#   AUTOJUDGE_INTAKE_BASIC_AUTH_USER     (leave empty for fully public intake)
+#   AUTOJUDGE_INTAKE_BASIC_AUTH_PASS     (leave empty for fully public intake)
+#   AUTOJUDGE_HACKATHON_START / _END     (helpful for header copy / integrity)
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "bash -lc 'streamlit run src/autojudge/intake/form.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true'"
+healthcheckPath = "/_stcore/health"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5

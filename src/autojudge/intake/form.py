@@ -9,15 +9,18 @@ slide deck. Everything else is optional, including the SUBMISSION.md body.
 The Inference Agent reads whichever artifacts were supplied and synthesises
 a structured view of the submission with full provenance.
 
-Each submission writes to data/submissions/<id>/ as:
-- submission.md       (free-form context, or empty note if not supplied)
-- deck.pdf            (uploaded slide deck if provided)
-- meta.json           (URLs, candidate info)
-- status=pending in the trace store so the batch runner picks it up
+Persistence: the form is filesystem-free on the storage backend. Free-form
+context is inlined on ``submissions.submission_md_raw`` and deck PDFs land
+in ``submission_blobs`` keyed by submission_id. This means the intake form
+and the dashboard service can run on different Railway services and still
+share data through the Postgres trace store. A copy of the body / deck is
+also written to the local data dir when present (best-effort backup for
+local-dev re-runs); the orchestrator always reads from the store.
 """
 from __future__ import annotations
 
 import json
+import logging
 import re
 import unicodedata
 from datetime import datetime, timezone
@@ -34,6 +37,8 @@ from autojudge.models import (
     SubmissionStatus,
 )
 from autojudge.trace.store import get_store
+
+logger = logging.getLogger(__name__)
 
 
 def _slug(text: str) -> str:
@@ -129,19 +134,27 @@ def main() -> None:
         return
 
     sub_id = _gen_id(name)
-    sub_dir = submissions_dir / sub_id
-    sub_dir.mkdir(parents=True, exist_ok=True)
-
-    md_path = sub_dir / "submission.md"
     body = submission_md.strip()
     if not body:
         body = "(no free-form context supplied; rely on linked artifacts)"
-    md_path.write_text(body + "\n", encoding="utf-8")
 
-    deck_path: str | None = None
-    if deck_file is not None:
-        deck_path = str(sub_dir / "deck.pdf")
-        Path(deck_path).write_bytes(deck_file.getvalue())
+    # Best-effort local copy of the submission body and deck. When the intake
+    # form runs on a dedicated Railway service without a volume mount, this
+    # block silently no-ops; the canonical persistence is in the trace store.
+    md_path_str: str | None = None
+    deck_path_str: str | None = None
+    try:
+        sub_dir = submissions_dir / sub_id
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        md_path = sub_dir / "submission.md"
+        md_path.write_text(body + "\n", encoding="utf-8")
+        md_path_str = str(md_path)
+        if deck_file is not None:
+            deck_path = sub_dir / "deck.pdf"
+            deck_path.write_bytes(deck_file.getvalue())
+            deck_path_str = str(deck_path)
+    except OSError as exc:
+        logger.info("intake: local artifact write skipped (%s)", exc)
 
     meta = {
         "id": sub_id,
@@ -153,27 +166,33 @@ def main() -> None:
         "repo_url": repo_url.strip() or None,
         "live_url": live_url.strip() or None,
         "video_url": video_url.strip() or None,
-        "deck_path": deck_path,
+        "deck_path": deck_path_str,
         "test_credentials": test_credentials.strip() or None,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    (sub_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
     submission = Submission(
         id=sub_id,
         candidate=CandidateInfo(**meta["candidate"]),
         artifacts=SubmissionArtifacts(
-            submission_md_path=str(md_path),
+            submission_md_path=md_path_str or "",
             repo_url=meta["repo_url"],
             live_url=meta["live_url"],
             video_url=meta["video_url"],
-            deck_path=deck_path,
+            deck_path=deck_path_str,
             test_credentials=meta["test_credentials"],
         ),
         submission_md_raw=body,
         status=SubmissionStatus.PENDING,
     )
     store.upsert_submission(submission)
+    if deck_file is not None:
+        store.put_blob(
+            sub_id,
+            "deck.pdf",
+            deck_file.getvalue(),
+            content_type="application/pdf",
+        )
 
     st.success(f"Submission received: `{sub_id}`")
     st.info(
