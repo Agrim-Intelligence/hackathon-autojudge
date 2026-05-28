@@ -581,13 +581,25 @@ def _playwright_chromium_status() -> tuple[bool, str]:
 
     Looks for `chromium-*` (full browser, used by channel='chromium') or
     `chromium_headless_shell-*` (older default). Returns (ok, path-or-reason).
+
+    Honours ``PLAYWRIGHT_BROWSERS_PATH`` first (set to ``/ms-playwright`` in
+    the Docker image) before falling back to the per-OS default cache dirs,
+    so the check matches where Playwright actually resolves the binary at
+    runtime.
     """
-    cache_dir = Path.home() / "Library" / "Caches" / "ms-playwright"
-    if not cache_dir.exists():
-        # Linux / CI fallback
-        cache_dir = Path.home() / ".cache" / "ms-playwright"
-    if not cache_dir.exists():
-        return False, f"Playwright cache dir not found at {cache_dir}"
+    import os
+
+    candidates: list[Path] = []
+    env_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if env_path:
+        candidates.append(Path(env_path))
+    candidates.append(Path.home() / "Library" / "Caches" / "ms-playwright")
+    candidates.append(Path.home() / ".cache" / "ms-playwright")
+
+    cache_dir = next((c for c in candidates if c.exists()), None)
+    if cache_dir is None:
+        checked = ", ".join(str(c) for c in candidates)
+        return False, f"Playwright cache dir not found (checked: {checked})"
     found: list[str] = []
     try:
         for entry in cache_dir.iterdir():
