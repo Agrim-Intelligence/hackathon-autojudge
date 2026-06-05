@@ -52,13 +52,18 @@ def _select_representative_files(repo_url: str) -> dict[str, str]:
     return gh.fetch_files(repo_url, paths)
 
 
-# LLM integrity flags that speculate about codebase size or commit-count ratios
-# are dropped: the deterministic layer already owns commit signals, and size is a
-# byte total (not lines) so "large codebase => bulk import" is forbidden speculation.
+# LLM integrity flags that speculate about codebase size, contributor count, or
+# restate the commit-window signal are dropped: the deterministic layer already
+# owns commit-window/contributor signals, and size is a byte total (not lines) so
+# "large codebase => bulk import" is forbidden speculation. Genuine quality
+# observations (no tests, no CI/CD, hardcoded secrets) are kept.
 _SPECULATIVE_FLAG = re.compile(
     r"\b(bulk\s+import|lines?\s+of\s+code|line\s+count|codebase\s+size|"
-    r"\d[\d,kKmM]*\s*(lines|loc)|too\s+(large|big)|suspicious(ly)?\s+large|"
-    r"commits?\s+(suggest|imply|indicat))",
+    r"\d[\d,kKmM]*\s*(lines|loc)|\d[\d,]*\s*(kb|mb|gb|bytes)|"
+    r"substantial\s+(\w+\s+){0,2}codebase|single\s+contributor|"
+    r"too\s+(large|big)|suspicious(ly)?\s+large|"
+    r"zero\s+commits|commits?\s+inside\b|commits?\s+in\s+the\b|"
+    r"pre-?existing|predates|commits?\s+(suggest|imply|indicat))",
     re.IGNORECASE,
 )
 
