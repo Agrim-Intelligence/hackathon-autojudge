@@ -72,6 +72,80 @@ def _parse_json_list(raw: Any) -> list:
         return []
 
 
+# Integrity-relevant (loud) flag prefixes that are NOT a full quarantine but
+# still warrant a warning, vs benign informational notes for judges.
+_WARN_FLAG_PREFIXES = ("future_timestamp:", "duplicate_artifact:", "prompt_injection_severity=")
+_QUARANTINE_FLAG_PREFIX = "quarantine_cause:"
+
+
+def _classify_flags(flags: list[str], verdict_effective: str | None) -> tuple[bool, list[str], list[str]]:
+    """Split integrity flags by severity: (is_quarantine, warn_flags, note_flags).
+
+    Quarantine and the genuine-integrity warn signals stay loud; everything else
+    is a benign judge note. Presence of *any* flag no longer implies quarantine.
+    """
+    is_quarantine = verdict_effective == "quarantined" or any(
+        f.startswith(_QUARANTINE_FLAG_PREFIX) for f in flags
+    )
+    warn = [f for f in flags if f.startswith(_WARN_FLAG_PREFIXES)]
+    notes = [
+        f
+        for f in flags
+        if not f.startswith(_QUARANTINE_FLAG_PREFIX) and not f.startswith(_WARN_FLAG_PREFIXES)
+    ]
+    return is_quarantine, warn, notes
+
+
+# Deterministic agents that legitimately have no LLM model/provider.
+_NO_LLM_AGENTS = {"repo_snapshot", "deploy_probe", "orchestrator"}
+
+
+def _dedup_runs(runs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    """Collapse the full verifier_runs history (40+ rows across restarts) to the
+    latest successful row per agent. get_runs is ORDER BY started_at, so last
+    write wins. Returns (latest_per_agent, restart_count)."""
+    latest: dict[str, dict[str, Any]] = {}
+    restarts = 0
+    for run in runs:
+        if run.get("error") == "restart_during_run":
+            restarts += 1
+            continue
+        latest[run["agent"]] = run
+    return list(latest.values()), restarts
+
+
+def _reachability_label(latest: list[dict[str, Any]]) -> str:
+    """Honest reachability from the latest deploy_probe + browser_verifier rows,
+    paired so it neither over-claims (reachable alone) nor under-claims."""
+    by_agent = {r["agent"]: r for r in latest}
+    probe = by_agent.get("deploy_probe")
+    if not probe:
+        return "—"
+    try:
+        out = json.loads(probe.get("output_json") or "{}")
+    except Exception:
+        out = {}
+    if not out.get("url"):
+        return "no URL"
+    if not out.get("reachable"):
+        return "unreachable"
+    title = (out.get("title") or "").strip()[:24]
+    label = f"✓ {out.get('status_code') or ''}".strip()
+    if title:
+        label += f" · {title}"
+    bv = by_agent.get("browser_verifier")
+    if bv:
+        try:
+            bout = json.loads(bv.get("output_json") or "{}")
+            jr = bout.get("journey_results") or []
+            if jr:
+                ok = sum(1 for j in jr if j.get("success"))
+                label += f" · {ok}/{len(jr)} journeys"
+        except Exception:
+            pass
+    return label
+
+
 def _judge_identity() -> str:
     """Best-effort identity for override audit.
 
@@ -254,7 +328,7 @@ def render_leaderboard() -> None:
     table_rows = []
     for idx, r in enumerate(rows, start=1):
         flags = _parse_json_list(r.get("integrity_flags_json"))
-        quarantined = r.get("verdict_effective") == "quarantined" or bool(flags)
+        is_quarantine, warn_flags, _notes = _classify_flags(flags, r.get("verdict_effective"))
         eff = r.get("verdict_effective") or r.get("verdict") or "—"
         if r.get("verdict_override"):
             eff = f"{eff}*"
@@ -269,7 +343,7 @@ def render_leaderboard() -> None:
                 "verdict": eff,
                 "shortlist": r.get("shortlist_state") or "none",
                 "live": bool(r.get("live_url")),
-                "integrity": "⚠" if quarantined else "",
+                "integrity": "⛔" if is_quarantine else ("⚠" if warn_flags else ""),
                 "review_items": len(_parse_json_list(r.get("judge_review_items_json"))),
                 "status": r.get("status"),
             }
@@ -320,7 +394,7 @@ def _render_board_row(r: dict[str, Any], judge_identity: str) -> None:
     eff = r.get("verdict_effective") or r.get("verdict") or "—"
     flags = _parse_json_list(r.get("integrity_flags_json"))
     review_items = _parse_json_list(r.get("judge_review_items_json"))
-    quarantined = eff == "quarantined" or bool(flags)
+    is_quarantine, warn_flags, note_flags = _classify_flags(flags, eff)
     shortlist_state = r.get("shortlist_state") or "none"
     rank = r.get("shortlist_rank")
     score = _fmt_score(r.get("total_score"))
@@ -330,7 +404,7 @@ def _render_board_row(r: dict[str, Any], judge_identity: str) -> None:
         f"#{rank if rank is not None else '—'}  ·  {r.get('candidate_name')} "
         f"({r.get('team') or 'solo'})  ·  {score}  ·  {eff}"
         + (f"  ·  {shortlist_state.upper()}" if state_tag else "")
-        + ("  ·  ⚠" if quarantined else "")
+        + ("  ·  ⛔" if is_quarantine else ("  ·  ⚠" if warn_flags else ""))
     )
     with st.expander(header, expanded=False):
         chips = [
@@ -339,8 +413,10 @@ def _render_board_row(r: dict[str, Any], judge_identity: str) -> None:
         ]
         if state_tag:
             chips.append(state_tag)
-        if quarantined:
-            chips.append(":red-background[INTEGRITY]")
+        if is_quarantine:
+            chips.append(":red-background[QUARANTINED]")
+        elif warn_flags:
+            chips.append(":orange-background[INTEGRITY]")
         st.markdown("  ".join(chips))
 
         meta = st.columns(4)
@@ -358,16 +434,20 @@ def _render_board_row(r: dict[str, Any], judge_identity: str) -> None:
             dim_chips.append(f"**{dim.name}** `{label}`")
         st.markdown("  ·  ".join(dim_chips))
 
-        if quarantined and flags:
-            st.warning("Integrity flags:\n" + "\n".join(f"- {f}" for f in flags))
+        if is_quarantine:
+            st.error("⛔ Quarantined:\n" + "\n".join(f"- {f}" for f in flags if f.startswith(_QUARANTINE_FLAG_PREFIX)))
+        if warn_flags:
+            st.warning("Integrity signals:\n" + "\n".join(f"- {f}" for f in warn_flags))
+        if note_flags:
+            st.info("Notes for judges:\n" + "\n".join(f"- {f}" for f in note_flags))
         if review_items:
             st.caption(f"{len(review_items)} judge-review item(s) deferred to humans.")
         if r.get("summary"):
             st.write(r["summary"])
         if r.get("repo_url"):
-            st.caption(f"Repo: {r['repo_url']}")
+            st.markdown(f"Repo: [{r['repo_url']}]({r['repo_url']})")
         if r.get("live_url"):
-            st.caption(f"Live: {r['live_url']}")
+            st.markdown(f"Live: [{r['live_url']}]({r['live_url']})")
         if r.get("judge_notes"):
             st.info(f"Judge notes: {r['judge_notes']}")
 
@@ -520,6 +600,7 @@ def render_submission(submission_id: str) -> None:
     total = store.get_total(submission_id)
     scores = store.get_scores(submission_id)
     runs = store.get_runs(submission_id)
+    latest_runs, restart_count = _dedup_runs(runs)
     cost_info = store.get_submission_cost(submission_id)
 
     st.subheader(f"{submission_id}")
@@ -540,7 +621,11 @@ def render_submission(submission_id: str) -> None:
         verdict_help = "Auto-judge recommendation. No human override."
     cols[1].metric("Verdict", verdict_label, help=verdict_help)
     cols[2].metric("Archetype", sub["archetype"])
-    cols[3].metric("Live URL", "yes" if sub["live_url"] else "no")
+    cols[3].metric(
+        "Live URL",
+        _reachability_label(latest_runs) if sub["live_url"] else "no",
+        help="deploy_probe reachability paired with browser journey results.",
+    )
     if total:
         cols[4].metric(
             "Evaluable weight",
@@ -562,15 +647,22 @@ def render_submission(submission_id: str) -> None:
         )
 
     flags = json.loads(total["integrity_flags_json"]) if total and total.get("integrity_flags_json") else []
-    cause_flags = [f for f in flags if f.startswith("insufficient_cause:")]
+    verdict_effective = verdict_override or auto_verdict
+    is_quarantine, warn_flags, note_flags = _classify_flags(flags, verdict_effective)
+    if is_quarantine:
+        st.error("⛔ **Quarantined.**\n" + "\n".join(
+            f"- {f}" for f in flags if f.startswith(_QUARANTINE_FLAG_PREFIX)))
+    if warn_flags:
+        st.warning("Integrity signals (for judge review):\n" + "\n".join(f"- {f}" for f in warn_flags))
+    cause_flags = [f for f in note_flags if f.startswith("insufficient_cause:")]
     if cause_flags:
         st.info(
-            "⚠️ **Credential-walled — needs test credentials, not weak work.** "
+            "**Credential-walled — needs test credentials, not weak work.** "
             + " ".join(f[len("insufficient_cause:"):].strip() for f in cause_flags)
         )
-    other_flags = [f for f in flags if not f.startswith("insufficient_cause:")]
-    if other_flags:
-        st.warning("Integrity flags:\n" + "\n".join(f"- {f}" for f in other_flags))
+    plain_notes = [f for f in note_flags if not f.startswith("insufficient_cause:")]
+    if plain_notes:
+        st.info("Notes for judges:\n" + "\n".join(f"- {f}" for f in plain_notes))
 
     inference_out = _inference_output_for(submission_id)
 
@@ -583,11 +675,11 @@ def render_submission(submission_id: str) -> None:
 
     st.markdown("### Artifacts")
     if sub["repo_url"]:
-        st.write(f"- Repo: {sub['repo_url']}")
+        st.markdown(f"- Repo: [{sub['repo_url']}]({sub['repo_url']})")
     if sub["live_url"]:
-        st.write(f"- Live URL: {sub['live_url']}")
+        st.markdown(f"- Live URL: [{sub['live_url']}]({sub['live_url']})")
     if sub["video_url"]:
-        st.write(f"- Video: {sub['video_url']}")
+        st.markdown(f"- Video: [{sub['video_url']}]({sub['video_url']})")
     if sub["deck_path"]:
         st.write(f"- Deck path: `{sub['deck_path']}`")
 
@@ -622,14 +714,22 @@ def render_submission(submission_id: str) -> None:
             st.json(inference_out, expanded=False)
 
     st.markdown("### Agent trace")
-    for run in runs:
+    if restart_count:
+        st.caption(
+            f"Showing the latest run per agent. {restart_count} interrupted "
+            f"restart attempt(s) suppressed ({len(runs)} total rows)."
+        )
+    for run in latest_runs:
         precise_marker = (
             " (precise)" if run.get("cost_is_precise") else " (heuristic)"
             if run["cost_usd"] else ""
         )
+        if run["agent"] in _NO_LLM_AGENTS:
+            prov, mdl = "n/a (no LLM)", "n/a"
+        else:
+            prov, mdl = (run["provider"] or "-"), (run["model"] or "-")
         with st.expander(
-            f"{run['agent']}  ({run['provider'] or '-'}, model={run['model'] or '-'})  "
-            f"started={run['started_at']}",
+            f"{run['agent']}  ({prov}, model={mdl})  started={run['started_at']}",
             expanded=False,
         ):
             st.caption(
@@ -642,6 +742,11 @@ def render_submission(submission_id: str) -> None:
                 st.json(payload, expanded=False)
             except Exception:
                 st.code(run["output_json"][:5000])
+    if restart_count:
+        with st.expander(f"Restart history ({restart_count} suppressed rows)", expanded=False):
+            for run in runs:
+                if run.get("error") == "restart_during_run":
+                    st.caption(f"{run['started_at']} · {run['agent']} · {run['error']}")
 
     override_panel(submission_id, sub, total)
 

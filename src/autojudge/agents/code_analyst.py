@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 
 from ..intake import github as gh
@@ -51,6 +52,21 @@ def _select_representative_files(repo_url: str) -> dict[str, str]:
     return gh.fetch_files(repo_url, paths)
 
 
+# LLM integrity flags that speculate about codebase size or commit-count ratios
+# are dropped: the deterministic layer already owns commit signals, and size is a
+# byte total (not lines) so "large codebase => bulk import" is forbidden speculation.
+_SPECULATIVE_FLAG = re.compile(
+    r"\b(bulk\s+import|lines?\s+of\s+code|line\s+count|codebase\s+size|"
+    r"\d[\d,kKmM]*\s*(lines|loc)|too\s+(large|big)|suspicious(ly)?\s+large|"
+    r"commits?\s+(suggest|imply|indicat))",
+    re.IGNORECASE,
+)
+
+
+def _filter_llm_integrity_flags(flags: list[str]) -> list[str]:
+    return [f for f in flags if not _SPECULATIVE_FLAG.search(f)]
+
+
 def _deterministic_flags(metrics: RepoMetrics, *, skip_window_check: bool = False) -> list[str]:
     flags: list[str] = []
     if metrics.total_commits == 0:
@@ -58,7 +74,8 @@ def _deterministic_flags(metrics: RepoMetrics, *, skip_window_check: bool = Fals
     elif not skip_window_check:
         if metrics.commits_in_window == 0:
             flags.append(
-                "Zero commits inside hackathon window — submission likely predates the event."
+                "Zero commits inside the hackathon window (informational — the repo may "
+                "predate or postdate the window; for judge review, not a penalty)."
             )
         elif metrics.total_commits >= 5 and metrics.commits_in_window <= 1:
             flags.append(
@@ -102,6 +119,11 @@ def analyze(
     llm = get_llm()
     system_parts = [PromptPart(text=_load_prompt(), cacheable=True)]
     metrics_payload = metrics.model_dump(mode="json")
+    # `line_count_estimate` actually holds GitHub language BYTE counts, not
+    # lines. Surface it honestly so the LLM cannot speculate "N lines => bulk
+    # import" over a mislabeled byte total.
+    if "line_count_estimate" in metrics_payload:
+        metrics_payload["code_size_bytes_estimate"] = metrics_payload.pop("line_count_estimate")
     langs = metrics_payload.get("languages") or {}
     if isinstance(langs, dict) and len(langs) > 8:
         top = sorted(langs.items(), key=lambda x: x[1], reverse=True)[:8]
@@ -124,7 +146,8 @@ def analyze(
         report = CodeAnalystReport(
             metrics=metrics,
             quality_signals=dict(data.get("quality_signals", {}) or {}),
-            integrity_flags=integrity + [str(x) for x in (data.get("integrity_flags", []) or [])],
+            integrity_flags=integrity
+            + _filter_llm_integrity_flags([str(x) for x in (data.get("integrity_flags", []) or [])]),
             summary=str(data.get("summary", "")),
             summary_for_scorer=str(data.get("summary_for_scorer") or data.get("summary", "")),
         )

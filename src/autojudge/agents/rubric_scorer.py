@@ -39,6 +39,20 @@ from .api_prober import ApiProberReport
 logger = logging.getLogger(__name__)
 
 
+def _browser_journey_lines(browser: BrowserVerifierReport) -> str:
+    """One line per journey for the scorer prompt: render progress + an
+    observation snippet. `final_observation` is planner-authored text derived
+    from page content already sanitized at the live-page boundary
+    (browser_verifier sanitize(source_label="live-page")), so it is not a raw
+    candidate channel — truncate only, no second guard pass."""
+    legs = []
+    for j in browser.journey_results:
+        obs = f" — {j.final_observation[:120]}" if j.final_observation else ""
+        status = "ok" if j.success else f"failed@{j.steps_completed}/{j.total_steps}"
+        legs.append(f"- {j.journey_name}: {status}{obs}")
+    return "\n".join(legs) or "(no journeys)"
+
+
 def _load_prompt() -> str:
     return (Path(__file__).resolve().parents[3] / "prompts" / "rubric_scorer.md").read_text(
         encoding="utf-8"
@@ -109,6 +123,10 @@ def _max_evidence_kind(
     # An API submission can reach `verified` functional via the prober even
     # though it has no browser-renderable UI. UX stays browser-only.
     functional_evidence = browser_ok or api_ok
+    # The page reached and rendered (titled, not auth-walled) even if no
+    # scripted journey completed. This is legitimate sub-`verified` evidence
+    # for functional/UX — a rendered UI the pipeline actually observed.
+    rendered = bool(browser.live_url_reachable and browser.page_title and not browser.auth_blocked)
     has_repo = code.metrics is not None
     candidate_words = _candidate_provided_body(inferred)
     cross_has_signal = bool(cross.summary_for_scorer or cross.summary or cross.discrepancies)
@@ -117,13 +135,15 @@ def _max_evidence_kind(
     if dim_id == RubricDimensionId.FUNCTIONAL:
         if functional_evidence:
             return "verified"
-        if has_repo or cross_has_signal:
+        if has_repo or cross_has_signal or rendered:
             return "inferred"
         return "stated" if candidate_words else "inferred"
 
     if dim_id == RubricDimensionId.UX:
         if browser_ok:
             return "verified"
+        if rendered:
+            return "inferred"
         return "stated" if candidate_words else "inferred"
 
     if dim_id == RubricDimensionId.AI_SOPHISTICATION:
@@ -337,8 +357,10 @@ def score(
         f"### AI sophistication summary\n{ai_soph.summary_for_scorer or ai_soph.summary or '(no summary)'}\n"
         f"Score band: {ai_soph.score_band}; thin-wrapper signals: {ai_soph.thin_wrapper_signals}\n\n"
         f"### Browser verifier summary\n{browser.summary_for_scorer or browser.summary or '(no summary)'}\n"
-        f"Reachable: {browser.live_url_reachable}; skipped: {browser.skipped} "
-        f"({browser.skipped_reason or ''})\n\n"
+        f"Reachable: {browser.live_url_reachable}; page_title: {browser.page_title!r}; "
+        f"auth_blocked: {browser.auth_blocked}; skipped: {browser.skipped} "
+        f"({browser.skipped_reason or ''})\n"
+        f"Journeys:\n{_browser_journey_lines(browser)}\n\n"
         f"### API prober summary\n{api_block}\n\n"
         f"### Cross-check summary\n{cross.summary_for_scorer or cross.summary or '(no summary)'}\n"
         f"Discrepancies: {discrepancies_block}\n\n"
@@ -372,6 +394,13 @@ def score(
             ),
             None,
         )
+
+    # Render-only UX evidence (page rendered, no journey completed) is capped
+    # deterministically so the LLM cannot score a never-driven page highly. A
+    # grounded journey success (_has_browser_success) lifts the cap.
+    ux_render_only = not _has_browser_success(browser) and bool(
+        browser.live_url_reachable and browser.page_title and not browser.auth_blocked
+    )
 
     raw_dims: dict[RubricDimensionId, dict] = {}
     for item in data.get("dimensions", []) or []:
@@ -449,6 +478,13 @@ def score(
                 raw_score = float(cap)
                 cap_applied = True
                 cap_reason = reason
+        if dim.id == RubricDimensionId.UX and ux_render_only and raw_score > 7.0:
+            raw_score = 7.0
+            cap_applied = True
+            cap_reason = (
+                "Live URL rendered but no journey completed end-to-end — UX capped at "
+                "7/10 (render-only evidence, short of a verified flow)."
+            )
         weighted = round(raw_score * weight / 10.0, 2)
         weighted_total_evaluable += weighted
         evaluable_weight += weight

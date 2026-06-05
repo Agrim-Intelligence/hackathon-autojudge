@@ -183,7 +183,9 @@ def verify(
     overall_summary = _summarize(journey_results)
     auth_blocked = any(_journey_blocked_by_auth(j) for j in journey_results)
     scorer_summary = overall_summary
-    if auth_blocked and not any(j.success for j in journey_results):
+    journeys_ran = bool(journey_results)
+    none_succeeded = not any(j.success for j in journey_results)
+    if auth_blocked and none_succeeded:
         scorer_summary += (
             " Journeys were blocked by a login / auth wall"
             + (
@@ -193,6 +195,13 @@ def verify(
             )
             + " Treat functional/UX as judge-review items, not weak work."
         )
+    elif journeys_ran and none_succeeded:
+        # The page reached and rendered, but the scripted journeys ran out of
+        # step budget. Without this clause the scorer sees only the bare
+        # "0/N journeys succeeded." count and nulls UX — discarding the
+        # render evidence the verifier actually observed. Report it as
+        # observed rendering, NOT journey success (grounding stays intact).
+        scorer_summary += " " + _render_evidence_clause(page_title, journey_results)
     return (
         BrowserVerifierReport(
             live_url_reachable=True,
@@ -646,3 +655,21 @@ def _summarize(results: list[JourneyResult]) -> str:
         return "No journeys executed."
     n_ok = sum(1 for r in results if r.success)
     return f"{n_ok}/{len(results)} journeys succeeded."
+
+
+def _render_evidence_clause(page_title: str | None, results: list[JourneyResult]) -> str:
+    """Positive render facts the verifier observed when journeys failed but the
+    page rendered. Built only from already-captured report data; asserts
+    rendering, never journey success."""
+    shots = sum(len(r.screenshots) for r in results)
+    legs = "; ".join(
+        f"'{r.journey_name}' reached step {r.steps_completed}/{r.total_steps}"
+        + (f" ({r.final_observation[:80]})" if r.final_observation else "")
+        for r in results
+    )
+    return (
+        f"Live app reachable and rendered (title={page_title!r}; {shots} screenshots captured); "
+        f"{legs}. No declared journey completed within step budget — the UI exists and renders "
+        "but the end-to-end flow was not driven to its expected outcome. Treat UX/functional as "
+        "observable-but-journey-incomplete (legible signal short of verified), not absent."
+    )
