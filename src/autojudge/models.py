@@ -235,6 +235,10 @@ class BrowserVerifierReport(BaseModel):
     summary_for_scorer: str = ""
     skipped: bool = False
     skipped_reason: str | None = None
+    # True when one or more journeys could not complete because the live app is
+    # gated behind a login / auth wall. Drives the legible "credential-walled"
+    # insufficient reason in the scorer + dashboard.
+    auth_blocked: bool = False
 
 
 class AISophisticationReport(BaseModel):

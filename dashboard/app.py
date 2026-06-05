@@ -408,10 +408,16 @@ def render_submission(submission_id: str) -> None:
             "See the 'insufficient' dimensions below for the unscored areas."
         )
 
-    if total and total.get("integrity_flags_json"):
-        flags = json.loads(total["integrity_flags_json"])
-        if flags:
-            st.warning("Integrity flags:\n" + "\n".join(f"- {f}" for f in flags))
+    flags = json.loads(total["integrity_flags_json"]) if total and total.get("integrity_flags_json") else []
+    cause_flags = [f for f in flags if f.startswith("insufficient_cause:")]
+    if cause_flags:
+        st.info(
+            "⚠️ **Credential-walled — needs test credentials, not weak work.** "
+            + " ".join(f[len("insufficient_cause:"):].strip() for f in cause_flags)
+        )
+    other_flags = [f for f in flags if not f.startswith("insufficient_cause:")]
+    if other_flags:
+        st.warning("Integrity flags:\n" + "\n".join(f"- {f}" for f in other_flags))
 
     inference_out = _inference_output_for(submission_id)
 

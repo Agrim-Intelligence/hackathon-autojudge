@@ -163,6 +163,18 @@ def verify(
             browser.close()
 
     overall_summary = _summarize(journey_results)
+    auth_blocked = any(_journey_blocked_by_auth(j) for j in journey_results)
+    scorer_summary = overall_summary
+    if auth_blocked and not any(j.success for j in journey_results):
+        scorer_summary += (
+            " Journeys were blocked by a login / auth wall"
+            + (
+                "; no working test credentials were available."
+                if not test_credentials
+                else " despite provided test credentials."
+            )
+            + " Treat functional/UX as judge-review items, not weak work."
+        )
     return (
         BrowserVerifierReport(
             live_url_reachable=True,
@@ -170,7 +182,8 @@ def verify(
             page_title=deploy.title,
             notable_console_errors=console_errors[:10],
             summary=overall_summary,
-            summary_for_scorer=overall_summary,
+            summary_for_scorer=scorer_summary,
+            auth_blocked=auth_blocked,
         ),
         llm_calls,
     )
@@ -265,10 +278,31 @@ def _run_journey(
 
         try:
             if action == "done":
-                success = bool(data.get("success", False))
+                claimed = bool(data.get("success", False))
                 final_observation = str(data.get("observation", ""))
                 observation = final_observation
-                records.append(StepRecord(step=step, action=data, observation=observation))
+                # Always capture a final-state screenshot — the LLM's "done" is
+                # the moment we most want evidence for, and the old code broke
+                # here without one.
+                done_shot = str(screenshots_dir / f"journey{j_idx}_done.png")
+                try:
+                    page.screenshot(path=done_shot, full_page=False)
+                    screenshots.append(done_shot)
+                except Exception:
+                    done_shot = None
+                # Ground the LLM's success claim in real page evidence. Journey
+                # `success` is otherwise pure LLM self-report and hallucinates
+                # (e.g. claiming a working UI on a bare auth-gated shell).
+                if claimed:
+                    grounded, why = _grounded_success(elements, records)
+                    success = grounded
+                    if not grounded:
+                        failure_reason = (
+                            f"claimed success not grounded in page evidence: {why}"
+                        )
+                records.append(
+                    StepRecord(step=step, action=data, observation=observation, screenshot_path=done_shot)
+                )
                 break
             if action == "click":
                 _click(page, elements, int(data.get("ref", -1)))
@@ -406,6 +440,74 @@ def _selector_for(el: dict[str, Any]) -> str:
 
 def _escape(s: str) -> str:
     return re.sub(r"['\"]", "", s)
+
+
+# Grounding floors: a page must clear one of these to count as "real content".
+_MIN_BODY_CHARS = 150
+_MIN_INTERACTIVE = 5
+
+# Narrow markers that a page is still an auth/login wall (not merely a "Sign in"
+# link in the nav of an otherwise-rich app). Combined with a password-field
+# check so logged-in dashboards don't trip.
+_AUTH_GATE_TEXT = re.compile(
+    r"(please\s+)?(sign\s?in|log\s?in)\s+to\s+(continue|access|use)"
+    r"|unauthoriz|401\b|403\s+forbidden|authentication\s+required"
+    r"|enter\s+your\s+password|login\s+required",
+    re.IGNORECASE,
+)
+
+# Broader markers used only to classify why a FAILED journey failed, so the
+# scorer/dashboard can say "credential-walled" rather than "weak work".
+_AUTH_OBSERVATION = re.compile(
+    r"\b(auth|login|log\s?in|sign\s?in|credential|unauthoriz|password|oauth|sso|401|403)\b",
+    re.IGNORECASE,
+)
+
+_INTERACTIVE_ACTIONS = {"click", "type", "press_enter", "goto"}
+
+
+def _looks_auth_gated(elements: dict[str, Any]) -> bool:
+    """Does the current page snapshot still look like a login / auth wall?"""
+    has_password = any(
+        (el.get("type") or "").lower() == "password"
+        for el in elements.get("interactive", [])
+    )
+    text = (elements.get("bodyText") or "") + " " + " ".join(
+        h.get("text", "") for h in elements.get("headings", [])
+    )
+    return has_password or bool(_AUTH_GATE_TEXT.search(text))
+
+
+def _grounded_success(elements: dict[str, Any], records: list[StepRecord]) -> tuple[bool, str]:
+    """Decide whether a claimed journey success is backed by real page evidence.
+
+    Accept only if the agent actually interacted with the app AND the resulting
+    page has meaningful, non-auth-gated content. Returns (ok, reason_if_not).
+    """
+    reasons: list[str] = []
+    interacted = any(
+        r.action.get("action") in _INTERACTIVE_ACTIONS and "errored" not in r.observation
+        for r in records
+    )
+    if not interacted:
+        reasons.append("no successful interactive action was performed")
+    body_len = len((elements.get("bodyText") or "").strip())
+    n_interactive = len(elements.get("interactive") or [])
+    if body_len < _MIN_BODY_CHARS and n_interactive < _MIN_INTERACTIVE:
+        reasons.append(
+            f"page has thin content (text={body_len} chars, {n_interactive} elements)"
+        )
+    if _looks_auth_gated(elements):
+        reasons.append("page still shows a login / auth gate")
+    return (not reasons, "; ".join(reasons))
+
+
+def _journey_blocked_by_auth(j: JourneyResult) -> bool:
+    """A failed journey that failed because the live app is credential-walled."""
+    if j.success:
+        return False
+    text = f"{j.final_observation or ''} {j.failure_reason or ''}"
+    return bool(_AUTH_OBSERVATION.search(text))
 
 
 def _launch_browser(pw, headless: bool):

@@ -471,6 +471,13 @@ def score(
     review_items = _dedupe_review_items(scorer_review_items + list(cross.judge_review_items))
     verdict = _compute_verdict(total, evaluable_weight)
 
+    if verdict == "insufficient" and browser.auth_blocked:
+        integrity_flags.append(
+            "insufficient_cause: live app is credential-walled — functional/UX could "
+            "not be verified end-to-end. Provide working test credentials and re-run. "
+            "This is a missing-evidence gap, not a quality penalty."
+        )
+
     rubric = RubricScore(
         submission_id=submission_id,
         archetype=archetype,
