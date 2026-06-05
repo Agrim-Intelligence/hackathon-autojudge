@@ -65,7 +65,10 @@ class Settings(BaseSettings):
     autojudge_browser_headless: bool = True
     autojudge_browser_timeout_s: int = 45
     autojudge_browser_max_steps: int = 12
-    autojudge_browser_max_steps_spa: int = 20
+    autojudge_browser_max_steps_spa: int = 28
+    # LLM-driven journeys are nondeterministic; retry a failed (non-auth) journey
+    # a few times and keep the first success. Bounds wasted work via max attempts.
+    autojudge_browser_journey_attempts: int = 3
 
     autojudge_submission_timeout_s: int = 900
     autojudge_snapshot_ttl_days: int = 14
