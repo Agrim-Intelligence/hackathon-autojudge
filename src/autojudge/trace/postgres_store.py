@@ -29,6 +29,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Iterator
 
+from ..config import get_settings
 from ..models import (
     DimensionScore,
     RubricScore,
@@ -254,12 +255,16 @@ class PostgresTraceStore:
                 )
 
     def reset_stale_running(self) -> list[str]:
-        """Reset submissions stuck in RUNNING (e.g. process killed mid-run).
+        """Bounded-requeue submissions stuck in RUNNING (process killed mid-run).
 
-        Same contract as the SQLite implementation: returns the list of ids
-        flipped to FAILED and emits a synthetic ``verifier_runs`` row per
-        affected submission so the trace is preserved.
+        Same contract as the SQLite implementation: under
+        ``autojudge_max_restart_retries`` (counted from prior
+        ``restart_during_run`` synthetic rows) a submission goes back to
+        'pending' for checkpoint-resumed re-run; at/above the limit it is
+        dead-lettered to 'failed'. A synthetic ``verifier_runs`` row is always
+        emitted so the trace is preserved.
         """
+        max_retries = get_settings().autojudge_max_restart_retries
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT id FROM submissions WHERE status = 'running'")
@@ -268,11 +273,37 @@ class PostgresTraceStore:
             if not ids:
                 return []
             now = _now_iso()
+            requeued = 0
+            dead_lettered = 0
             for sid in ids:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "UPDATE submissions SET status = 'failed' WHERE id = %s",
+                        "SELECT COUNT(*) AS n FROM verifier_runs "
+                        "WHERE submission_id = %s AND error = 'restart_during_run'",
                         (sid,),
+                    )
+                    prior = cur.fetchone()["n"]
+                attempt = prior + 1
+                if prior < max_retries:
+                    new_status = "pending"
+                    output = {
+                        "reason": "restart_during_run",
+                        "action": "restart_requeued",
+                        "attempt": attempt,
+                    }
+                    requeued += 1
+                else:
+                    new_status = "failed"
+                    output = {
+                        "reason": "restart_during_run",
+                        "action": "dead_letter",
+                        "attempt": attempt,
+                    }
+                    dead_lettered += 1
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE submissions SET status = %s WHERE id = %s",
+                        (new_status, sid),
                     )
                     cur.execute(
                         """
@@ -288,13 +319,16 @@ class PostgresTraceStore:
                             now,
                             now,
                             "stale_running_reset",
-                            json.dumps({"reason": "restart_during_run"}),
+                            json.dumps(output),
                             "restart_during_run",
                         ),
                     )
             logger.warning(
-                "postgres: reset %d submission(s) from RUNNING -> FAILED on boot",
-                len(ids),
+                "postgres: stale RUNNING reset on boot: %d requeued -> pending, "
+                "%d dead-lettered -> failed (max_retries=%d)",
+                requeued,
+                dead_lettered,
+                max_retries,
             )
             return ids
 

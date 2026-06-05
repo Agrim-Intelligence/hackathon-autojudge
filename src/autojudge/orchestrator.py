@@ -100,16 +100,23 @@ def _check_budget(agent: str, calls: list[LLMResponse]) -> list[str]:
         )
     return flags
 from .models import (
+    AISophisticationReport,
+    ArchetypeReport,
     BrowserVerifierReport,
     CandidateInfo,
+    CodeAnalystReport,
+    CrossCheckReport,
+    GuardReport,
+    InferredSubmission,
+    RubricScore,
     Submission,
     SubmissionArtifacts,
     SubmissionStatus,
     VerifierRun,
 )
 from .rubric.weights import profile_for
-from .sanitize.guard import sanitize
-from .trace.store import get_store
+from .sanitize.guard import max_injection_severity, sanitize
+from .trace.store import completed_agent_outputs, get_store
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +164,16 @@ def _record(
             error=error,
         )
     )
+
+
+def _rebuild_from_cache(model_cls, cached: dict[str, Any]):
+    """Reconstruct an agent's in-memory result from a persisted output_json.
+
+    Pydantic ignores extra keys by default, so bookkeeping fields the
+    orchestrator adds to the recorded output (``llm_call_count``,
+    ``llm_total_cost_usd``) are dropped cleanly on parse.
+    """
+    return model_cls.model_validate(cached)
 
 
 def _record_failure(store, submission_id: str, step: str, exc: BaseException) -> None:
@@ -289,26 +306,38 @@ def _run_pipeline(
     settings = get_settings()
     deadline_s = settings.autojudge_submission_timeout_s
     check_deadline = _make_deadline_check(submission_id, deadline_s)
-    # --- Guard ---
-    t0 = _now()
-    try:
-        guard_report, guard_resp = sanitize(submission_md_raw, source_label="submission_body")
-    except Exception as exc:
-        _record_failure(store, submission_id, "guard", exc)
-        raise
-    t1 = _now()
-    _record(
-        store,
-        submission_id,
-        "guard",
-        t0,
-        t1,
-        f"body length={len(submission_md_raw)}",
-        guard_report,
-        guard_resp,
-    )
-    budget_flags.extend(_check_budget("guard", [guard_resp] if guard_resp else []))
-    _pace()
+
+    # Resume-from-checkpoint: on a requeued re-run, prior successful agent
+    # outputs are rebuilt from the trace store instead of re-running the live
+    # agent. Loaded once. Only agents whose recorded output_json reconstructs
+    # 1:1 into their downstream object are resumable; agents that also produce
+    # non-persisted state (code_analyst -> RepoMetrics) always re-run.
+    resume = completed_agent_outputs(store, submission_id)
+
+    # --- Guard (resumable) ---
+    if "guard" in resume:
+        guard_report = _rebuild_from_cache(GuardReport, resume["guard"])
+        logger.info("[%s] resume: guard from checkpoint", submission_id)
+    else:
+        t0 = _now()
+        try:
+            guard_report, guard_resp = sanitize(submission_md_raw, source_label="submission_body")
+        except Exception as exc:
+            _record_failure(store, submission_id, "guard", exc)
+            raise
+        t1 = _now()
+        _record(
+            store,
+            submission_id,
+            "guard",
+            t0,
+            t1,
+            f"body length={len(submission_md_raw)}",
+            guard_report,
+            guard_resp,
+        )
+        budget_flags.extend(_check_budget("guard", [guard_resp] if guard_resp else []))
+        _pace()
 
     # --- Live URL probe (deterministic, no LLM) ---
     live_url = sub_row.get("live_url")
@@ -394,56 +423,69 @@ def _run_pipeline(
             )
 
     check_deadline("pre_inference")
-    # --- Inference Agent (tool-calling) ---
-    bundle = ArtifactBundle(
-        repo_url=sub_row.get("repo_url"),
-        live_url=sub_row.get("live_url"),
-        video_url=sub_row.get("video_url"),
-        deck_path=sub_row.get("deck_path"),
-        free_text=guard_report.sanitized_text,
-    )
-    t0 = _now()
-    try:
-        inferred, inference_calls = inference_agent.run_inference(bundle)
-    except Exception as exc:
-        _record_failure(store, submission_id, "inference", exc)
-        raise
-    t1 = _now()
-    last_inference_call = inference_calls[-1] if inference_calls else None
-    inference_out = inferred.model_dump(mode="json")
-    inference_out["llm_call_count"] = len(inference_calls)
-    inference_out["llm_total_cost_usd"] = round(
-        sum(c.estimated_cost_usd for c in inference_calls), 4
-    )
-    _record(
-        store,
-        submission_id,
-        "inference",
-        t0,
-        t1,
-        f"artifacts_seen={inferred.artifacts_seen}",
-        inference_out,
-        last_inference_call,
-    )
-    budget_flags.extend(_check_budget("inference", inference_calls))
-    _pace()
+    # --- Inference Agent (tool-calling, resumable) ---
+    if "inference" in resume:
+        inferred = _rebuild_from_cache(InferredSubmission, resume["inference"])
+        logger.info("[%s] resume: inference from checkpoint", submission_id)
+    else:
+        bundle = ArtifactBundle(
+            repo_url=sub_row.get("repo_url"),
+            live_url=sub_row.get("live_url"),
+            video_url=sub_row.get("video_url"),
+            deck_path=sub_row.get("deck_path"),
+            free_text=guard_report.sanitized_text,
+        )
+        t0 = _now()
+        try:
+            inferred, inference_calls = inference_agent.run_inference(bundle)
+        except Exception as exc:
+            _record_failure(store, submission_id, "inference", exc)
+            raise
+        t1 = _now()
+        last_inference_call = inference_calls[-1] if inference_calls else None
+        inference_out = inferred.model_dump(mode="json")
+        inference_out["llm_call_count"] = len(inference_calls)
+        inference_out["llm_total_cost_usd"] = round(
+            sum(c.estimated_cost_usd for c in inference_calls), 4
+        )
+        _record(
+            store,
+            submission_id,
+            "inference",
+            t0,
+            t1,
+            f"artifacts_seen={inferred.artifacts_seen}",
+            inference_out,
+            last_inference_call,
+        )
+        budget_flags.extend(_check_budget("inference", inference_calls))
+        _pace()
 
     check_deadline("pre_archetype")
-    # --- Archetype ---
-    t0 = _now()
-    try:
-        arch_report, arch_resp = archetype_agent.classify(inferred, has_live_url)
-    except Exception as exc:
-        _record_failure(store, submission_id, "archetype", exc)
-        raise
-    t1 = _now()
-    _record(store, submission_id, "archetype", t0, t1, "inferred submission", arch_report, arch_resp)
+    # --- Archetype (resumable) ---
+    if "archetype" in resume:
+        arch_report = _rebuild_from_cache(ArchetypeReport, resume["archetype"])
+        logger.info("[%s] resume: archetype from checkpoint", submission_id)
+    else:
+        t0 = _now()
+        try:
+            arch_report, arch_resp = archetype_agent.classify(inferred, has_live_url)
+        except Exception as exc:
+            _record_failure(store, submission_id, "archetype", exc)
+            raise
+        t1 = _now()
+        _record(store, submission_id, "archetype", t0, t1, "inferred submission", arch_report, arch_resp)
+        budget_flags.extend(_check_budget("archetype", [arch_resp] if arch_resp else []))
+        _pace()
+    # Idempotent: persist the archetype on the submission row whether freshly
+    # classified or resumed (downstream weights/profile read from the report).
     store.set_archetype(submission_id, arch_report.archetype.value)
-    budget_flags.extend(_check_budget("archetype", [arch_resp] if arch_resp else []))
-    _pace()
 
     check_deadline("pre_code_analyst")
-    # --- Code analyst ---
+    # --- Code analyst (NOT resumable) ---
+    # Returns a RepoMetrics object that ai_sophistication consumes but that is
+    # not part of the recorded output_json, so resuming would leave metrics
+    # unavailable. Prefer correctness: always re-run.
     t0 = _now()
     try:
         code_report, code_resp, metrics = code_analyst.analyze(
@@ -467,93 +509,112 @@ def _run_pipeline(
     _pace()
 
     check_deadline("pre_ai_sophistication")
-    # --- AI sophistication ---
-    t0 = _now()
-    try:
-        ai_report, ai_resp = ai_sophistication.probe(sub_row.get("repo_url"), metrics, inferred)
-    except Exception as exc:
-        _record_failure(store, submission_id, "ai_sophistication", exc)
-        raise
-    t1 = _now()
-    _record(
-        store,
-        submission_id,
-        "ai_sophistication",
-        t0,
-        t1,
-        sub_row.get("repo_url") or "(no repo)",
-        ai_report,
-        ai_resp,
-    )
-    budget_flags.extend(_check_budget("ai_sophistication", [ai_resp] if ai_resp else []))
-    _pace()
+    # --- AI sophistication (resumable) ---
+    if "ai_sophistication" in resume:
+        ai_report = _rebuild_from_cache(
+            AISophisticationReport, resume["ai_sophistication"]
+        )
+        logger.info("[%s] resume: ai_sophistication from checkpoint", submission_id)
+    else:
+        t0 = _now()
+        try:
+            ai_report, ai_resp = ai_sophistication.probe(sub_row.get("repo_url"), metrics, inferred)
+        except Exception as exc:
+            _record_failure(store, submission_id, "ai_sophistication", exc)
+            raise
+        t1 = _now()
+        _record(
+            store,
+            submission_id,
+            "ai_sophistication",
+            t0,
+            t1,
+            sub_row.get("repo_url") or "(no repo)",
+            ai_report,
+            ai_resp,
+        )
+        budget_flags.extend(_check_budget("ai_sophistication", [ai_resp] if ai_resp else []))
+        _pace()
 
-    # --- Browser verifier ---
+    # --- Browser verifier (resumable) ---
     # This is the most common cause of a hung submission. If we've already
     # blown the deadline, skip the agent and synthesise a stub report so the
     # scorer still has something to consume; otherwise run normally and
-    # convert a mid-run timeout into the same stub.
-    browser_skip_reason: str | None = None
-    try:
-        check_deadline("pre_browser_verifier")
-    except _DeadlineExceeded as exc:
-        browser_skip_reason = str(exc)
-
-    t0 = _now()
-    browser_calls: list[LLMResponse] = []
-    if browser_skip_reason is not None:
-        browser_report = BrowserVerifierReport(
-            live_url_reachable=has_live_url,
-            skipped=True,
-            skipped_reason=browser_skip_reason,
-            summary="Browser verifier skipped: submission_timeout reached.",
-            summary_for_scorer="Browser verifier skipped due to submission_timeout.",
+    # convert a mid-run timeout into the same stub. On a requeued re-run a
+    # prior successful report is rebuilt from the trace store, which is exactly
+    # what makes resume worthwhile (browser is the slowest agent).
+    if "browser_verifier" in resume:
+        browser_report = _rebuild_from_cache(
+            BrowserVerifierReport, resume["browser_verifier"]
         )
-        budget_flags.append(f"submission_timeout: {browser_skip_reason}")
+        logger.info("[%s] resume: browser_verifier from checkpoint", submission_id)
     else:
+        browser_skip_reason: str | None = None
         try:
-            browser_report, browser_calls = browser_verifier.verify(
-                live_url=live_url,
-                journeys=inferred.user_journeys,
-                submission_id=submission_id,
-                test_credentials=test_credentials,
+            check_deadline("pre_browser_verifier")
+        except _DeadlineExceeded as exc:
+            browser_skip_reason = str(exc)
+
+        t0 = _now()
+        browser_calls: list[LLMResponse] = []
+        if browser_skip_reason is not None:
+            browser_report = BrowserVerifierReport(
+                live_url_reachable=has_live_url,
+                skipped=True,
+                skipped_reason=browser_skip_reason,
+                summary="Browser verifier skipped: submission_timeout reached.",
+                summary_for_scorer="Browser verifier skipped due to submission_timeout.",
             )
-        except Exception as exc:
-            _record_failure(store, submission_id, "browser_verifier", exc)
-            raise
-    t1 = _now()
-    last_browser_call = browser_calls[-1] if browser_calls else None
-    total_browser_cost = sum(c.estimated_cost_usd for c in browser_calls)
-    out_dict = browser_report.model_dump(mode="json")
-    out_dict["llm_call_count"] = len(browser_calls)
-    out_dict["llm_total_cost_usd"] = round(total_browser_cost, 4)
-    _record(
-        store,
-        submission_id,
-        "browser_verifier",
-        t0,
-        t1,
-        f"live_url={live_url}",
-        out_dict,
-        last_browser_call,
-    )
-    budget_flags.extend(_check_budget("browser_verifier", browser_calls))
-    _pace()
+            budget_flags.append(f"submission_timeout: {browser_skip_reason}")
+        else:
+            try:
+                browser_report, browser_calls = browser_verifier.verify(
+                    live_url=live_url,
+                    journeys=inferred.user_journeys,
+                    submission_id=submission_id,
+                    test_credentials=test_credentials,
+                    archetype=arch_report.archetype,
+                )
+            except Exception as exc:
+                _record_failure(store, submission_id, "browser_verifier", exc)
+                raise
+        t1 = _now()
+        last_browser_call = browser_calls[-1] if browser_calls else None
+        total_browser_cost = sum(c.estimated_cost_usd for c in browser_calls)
+        out_dict = browser_report.model_dump(mode="json")
+        out_dict["llm_call_count"] = len(browser_calls)
+        out_dict["llm_total_cost_usd"] = round(total_browser_cost, 4)
+        _record(
+            store,
+            submission_id,
+            "browser_verifier",
+            t0,
+            t1,
+            f"live_url={live_url}",
+            out_dict,
+            last_browser_call,
+        )
+        budget_flags.extend(_check_budget("browser_verifier", browser_calls))
+        _pace()
 
     check_deadline("pre_cross_check")
-    # --- Cross-check ---
-    deck = parse_deck(sub_row.get("deck_path"))
-    transcript = fetch_transcript(sub_row.get("video_url"))
-    t0 = _now()
-    try:
-        cross_report, cross_resp = cross_check.check(inferred, deck, transcript, deploy, code_report)
-    except Exception as exc:
-        _record_failure(store, submission_id, "cross_check", exc)
-        raise
-    t1 = _now()
-    _record(store, submission_id, "cross_check", t0, t1, "deck+video vs repo+url", cross_report, cross_resp)
-    budget_flags.extend(_check_budget("cross_check", [cross_resp] if cross_resp else []))
-    _pace()
+    # --- Cross-check (resumable) ---
+    if "cross_check" in resume:
+        cross_report = _rebuild_from_cache(CrossCheckReport, resume["cross_check"])
+        logger.info("[%s] resume: cross_check from checkpoint", submission_id)
+    else:
+        deck = parse_deck(sub_row.get("deck_path"))
+        transcript = fetch_transcript(sub_row.get("video_url"))
+        t0 = _now()
+        try:
+            cross_report, cross_resp = cross_check.check(inferred, deck, transcript, deploy, code_report)
+        except Exception as exc:
+            _record_failure(store, submission_id, "cross_check", exc)
+            raise
+        t1 = _now()
+        _record(store, submission_id, "cross_check", t0, t1, "deck+video vs repo+url", cross_report, cross_resp)
+        budget_flags.extend(_check_budget("cross_check", [cross_resp] if cross_resp else []))
+        _pace()
 
     # --- Weights & caps ---
     weights = profile_for(arch_report.archetype, has_live_url=has_live_url)
@@ -596,6 +657,20 @@ def _run_pipeline(
         integrity_flags.extend(budget_flags)
     rubric_score.integrity_flags = list(dict.fromkeys(integrity_flags))
 
+    # Anti-cheat enforcement: clear cheats quarantine the submission (verdict
+    # override) so they cannot be shortlisted on score alone.
+    _apply_integrity_enforcement(
+        rubric_score,
+        guard_report=guard_report,
+        code_report=code_report,
+        inferred=inferred,
+        cross_report=cross_report,
+        repo_url=repo_url,
+        live_url=live_url,
+        store=store,
+        submission_id=submission_id,
+    )
+
     store.record_total(rubric_score)
     store.set_status(submission_id, SubmissionStatus.SCORED)
     logger.info(
@@ -604,6 +679,82 @@ def _run_pipeline(
         rubric_score.total_score,
         rubric_score.evaluable_weight,
     )
+
+
+def _apply_integrity_enforcement(
+    rubric_score: RubricScore,
+    *,
+    guard_report: GuardReport,
+    code_report: CodeAnalystReport,
+    inferred: Any,
+    cross_report: CrossCheckReport,
+    repo_url: str | None,
+    live_url: str | None,
+    store: Any,
+    submission_id: str,
+) -> None:
+    """Mutate `rubric_score.verdict` to "quarantined" for clear cheats.
+
+    Quarantine causes (any one suffices):
+    - prompt injection: guard severity >= 3 (sophisticated injection or the
+      fail-secure quarantine placeholder), or a high-severity injection on any
+      sanitized channel (recovered from the channel-sanitizers' integrity notes
+      stashed in inferred.gaps / cross_report.discrepancies).
+    - timeline cheat: zero in-window commits AND a future-dated commit history.
+
+    Also appends a lightweight `duplicate_artifact:` flag when another
+    submission already claims the same repo_url / live_url. Once set,
+    "quarantined" is never overwritten.
+    """
+    flags = list(rubric_score.integrity_flags)
+    quarantined = False
+
+    # --- Prompt injection ---
+    channel_flags = list(inferred.gaps) + [
+        str(d.get("detail", ""))
+        for d in cross_report.discrepancies
+        if isinstance(d, dict) and d.get("type") == "integrity"
+    ]
+    channel_severity = max_injection_severity(channel_flags)
+    if guard_report.severity >= 3 or channel_severity >= 3:
+        sev = max(guard_report.severity, channel_severity)
+        flags.append(f"quarantine_cause: prompt_injection severity={sev}")
+        quarantined = True
+
+    # --- Timeline cheat ---
+    metrics = code_report.metrics
+    if metrics is not None:
+        now = _now()
+        # Future-dated commits cannot exist in an honest history; treat the
+        # latest commit timestamp as the cheap signal (full per-commit dates
+        # are not surfaced on RepoMetrics).
+        future_dated = bool(metrics.last_commit_at and metrics.last_commit_at > now)
+        if future_dated:
+            flags.append("future_timestamp: commit dated in the future")
+        if metrics.commits_in_window == 0 and metrics.total_commits > 0 and future_dated:
+            flags.append(
+                "quarantine_cause: timeline — zero in-window commits + future-dated history"
+            )
+            quarantined = True
+
+    # --- Duplicate artifact (lightweight) ---
+    try:
+        existing = store.leaderboard(include_anchors=True)
+        for row in existing:
+            if row.get("id") == submission_id:
+                continue
+            if repo_url and row.get("repo_url") == repo_url:
+                flags.append(f"duplicate_artifact: repo_url shared with {row.get('id')}")
+                break
+            if live_url and row.get("live_url") == live_url:
+                flags.append(f"duplicate_artifact: live_url shared with {row.get('id')}")
+                break
+    except Exception as exc:  # pragma: no cover - duplicate check is best-effort
+        logger.warning("Duplicate-artifact check failed: %s", exc)
+
+    rubric_score.integrity_flags = list(dict.fromkeys(flags))
+    if quarantined:
+        rubric_score.verdict = "quarantined"
 
 
 def run_anchor(anchor_id: str, anchor_md_path: Path) -> Submission:

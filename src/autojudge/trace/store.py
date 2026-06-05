@@ -292,12 +292,20 @@ class TraceStore:
             conn.commit()
 
     def reset_stale_running(self) -> list[str]:
-        """Reset submissions stuck in RUNNING (e.g. process killed mid-batch).
+        """Requeue submissions stuck in RUNNING (e.g. process killed mid-batch).
 
-        Returns the list of submission ids that were reset. Records a
-        synthetic `verifier_runs` row per affected submission so the trace
-        shows what happened. Called once on store construction.
+        Each affected submission is bounded-requeued: under
+        ``autojudge_max_restart_retries`` it goes back to 'pending' (the batch
+        picker re-runs it, and checkpoint resume skips already-completed
+        agents); at/above the limit it is dead-lettered to 'failed'.
+
+        The retry counter is derived from the trace itself — the number of
+        prior ``restart_during_run`` synthetic rows for the submission — so no
+        schema column is needed. A synthetic ``verifier_runs`` row is always
+        emitted so the trace shows what happened. Returns the list of affected
+        submission ids. Called once on store construction.
         """
+        max_retries = get_settings().autojudge_max_restart_retries
         with self.connect() as conn:
             rows = conn.execute(
                 "SELECT id FROM submissions WHERE status = 'running'"
@@ -306,10 +314,34 @@ class TraceStore:
             if not ids:
                 return []
             now = _now_iso()
+            requeued = 0
+            dead_lettered = 0
             for sid in ids:
-                conn.execute(
-                    "UPDATE submissions SET status = 'failed' WHERE id = ?",
+                prior = conn.execute(
+                    "SELECT COUNT(*) AS n FROM verifier_runs "
+                    "WHERE submission_id = ? AND error = 'restart_during_run'",
                     (sid,),
+                ).fetchone()["n"]
+                attempt = prior + 1
+                if prior < max_retries:
+                    new_status = "pending"
+                    output = {
+                        "reason": "restart_during_run",
+                        "action": "restart_requeued",
+                        "attempt": attempt,
+                    }
+                    requeued += 1
+                else:
+                    new_status = "failed"
+                    output = {
+                        "reason": "restart_during_run",
+                        "action": "dead_letter",
+                        "attempt": attempt,
+                    }
+                    dead_lettered += 1
+                conn.execute(
+                    "UPDATE submissions SET status = ? WHERE id = ?",
+                    (new_status, sid),
                 )
                 conn.execute(
                     """
@@ -325,14 +357,17 @@ class TraceStore:
                         now,
                         now,
                         "stale_running_reset",
-                        json.dumps({"reason": "restart_during_run"}),
+                        json.dumps(output),
                         "restart_during_run",
                     ),
                 )
             conn.commit()
             logger.warning(
-                "Reset %d submission(s) from RUNNING -> FAILED on store boot",
-                len(ids),
+                "Stale RUNNING reset on store boot: %d requeued -> pending, "
+                "%d dead-lettered -> failed (max_retries=%d)",
+                requeued,
+                dead_lettered,
+                max_retries,
             )
             return ids
 
@@ -609,6 +644,37 @@ class TraceStore:
                 "SELECT id FROM submissions WHERE status IN ('pending', 'failed') ORDER BY created_at"
             ).fetchall()
             return [r["id"] for r in rows]
+
+
+def completed_agent_outputs(
+    store: TraceStoreProtocol, submission_id: str
+) -> dict[str, dict[str, Any]]:
+    """Map ``{agent: output_dict}`` of prior *successful* agent runs.
+
+    Used by the orchestrator to resume a pipeline from the first agent that
+    has no successful row yet, instead of re-running everything from guard.
+    An agent counts as done only when it has at least one row with no error
+    and a parseable ``output_json``; later successful rows win (re-runs append
+    rather than overwrite). Synthetic ``orchestrator`` rows are ignored — they
+    record failures/restarts, not resumable agent state.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for row in store.get_runs(submission_id):
+        agent = row.get("agent")
+        if not agent or agent == "orchestrator":
+            continue
+        if row.get("error"):
+            continue
+        raw = row.get("output_json")
+        if not raw:
+            continue
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+        except (TypeError, ValueError):
+            continue
+        if isinstance(parsed, dict):
+            out[agent] = parsed
+    return out
 
 
 _store: TraceStoreProtocol | None = None

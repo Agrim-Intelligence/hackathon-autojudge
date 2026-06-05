@@ -24,6 +24,15 @@ from ..config import get_settings
 from ..intake.deploy import probe as probe_deploy
 from ..llm import LLMResponse, PromptPart, get_llm
 from ..models import BrowserVerifierReport, InferredJourney, JourneyResult
+from ..sanitize.guard import sanitize
+
+# Archetypes whose live pages are typically SPA/JS-app heavy and need a larger
+# step budget to navigate past hydration and multi-screen flows.
+_SPA_ARCHETYPES = {"product", "tool", "research"}
+
+# SPA bootstrap shell markers — a page showing only these has not hydrated.
+_SPA_PLACEHOLDER = "You need to enable JavaScript to run this app."
+_MIN_HYDRATED_BODY_CHARS = 60
 
 logger = logging.getLogger(__name__)
 
@@ -48,11 +57,15 @@ class JourneyRun:
     records: list[StepRecord] = field(default_factory=list)
 
 
+# TODO(orchestrator): pass archetype=... from the parsed submission so the
+# step budget is chosen per archetype. Optional kwarg keeps the existing call
+# site in orchestrator.py working unchanged until then.
 def verify(
     live_url: str | None,
     journeys: list[InferredJourney],
     submission_id: str,
     test_credentials: str | None,
+    archetype: str | None = None,
 ) -> tuple[BrowserVerifierReport, list[LLMResponse]]:
     settings = get_settings()
     if not live_url:
@@ -118,6 +131,7 @@ def verify(
     journey_results: list[JourneyResult] = []
     llm_calls: list[LLMResponse] = []
     console_errors: list[str] = []
+    hydrated_titles: list[str] = []
 
     with sync_playwright() as pw:
         browser = _launch_browser(pw, settings.autojudge_browser_headless)
@@ -145,7 +159,7 @@ def verify(
             )
         try:
             for j_idx, journey in enumerate(journeys):
-                result, calls, errs = _run_journey(
+                result, calls, errs, hydrated_title = _run_journey(
                     browser=browser,
                     journey=journey,
                     j_idx=j_idx,
@@ -155,13 +169,17 @@ def verify(
                     settings=settings,
                     llm=llm,
                     system_prompt=system,
+                    archetype=archetype,
                 )
                 journey_results.append(result)
                 llm_calls.extend(calls)
                 console_errors.extend(errs)
+                if hydrated_title:
+                    hydrated_titles.append(hydrated_title)
         finally:
             browser.close()
 
+    page_title = _best_title(deploy.title, hydrated_titles)
     overall_summary = _summarize(journey_results)
     auth_blocked = any(_journey_blocked_by_auth(j) for j in journey_results)
     scorer_summary = overall_summary
@@ -179,7 +197,7 @@ def verify(
         BrowserVerifierReport(
             live_url_reachable=True,
             journey_results=journey_results,
-            page_title=deploy.title,
+            page_title=page_title,
             notable_console_errors=console_errors[:10],
             summary=overall_summary,
             summary_for_scorer=scorer_summary,
@@ -200,10 +218,12 @@ def _run_journey(
     settings,
     llm,
     system_prompt: str,
-) -> tuple[JourneyResult, list[LLMResponse], list[str]]:
+    archetype: str | None = None,
+) -> tuple[JourneyResult, list[LLMResponse], list[str], str | None]:
     records: list[StepRecord] = []
     calls: list[LLMResponse] = []
     console_errors: list[str] = []
+    hydrated_title: str | None = None
 
     context = browser.new_context(
         viewport={"width": 1280, "height": 800},
@@ -226,19 +246,51 @@ def _run_journey(
             ),
             calls,
             console_errors,
+            hydrated_title,
         )
+
+    js_shell_detected = _wait_for_hydration(page, settings.autojudge_browser_timeout_s)
+    try:
+        title = page.title()
+        if title and title.strip().lower() != "streamlit":
+            hydrated_title = title.strip()
+    except Exception:
+        pass
+
+    max_steps = (
+        settings.autojudge_browser_max_steps_spa
+        if js_shell_detected or (archetype in _SPA_ARCHETYPES)
+        else settings.autojudge_browser_max_steps
+    )
 
     success = False
     final_observation = ""
     failure_reason: str | None = None
     screenshots: list[str] = []
 
-    for step in range(settings.autojudge_browser_max_steps):
+    for step in range(max_steps):
         try:
             elements = _interactive_elements(page)
         except Exception as exc:
             failure_reason = f"failed to snapshot page: {exc}"
             break
+
+        # Sanitize untrusted live-page text before it reaches the planner LLM:
+        # a candidate's page must not be able to inject instructions.
+        injection_note = ""
+        raw_text = "\n".join(
+            [elements.get("bodyText", "") or ""]
+            + [h.get("text", "") for h in elements.get("headings", [])]
+            + [e.get("text", "") for e in elements.get("interactive", [])]
+        )
+        guard, guard_resp = sanitize(raw_text, source_label="live-page")
+        if guard_resp is not None:
+            calls.append(guard_resp)
+        elements = {**elements, "bodyText": guard.sanitized_text}
+        if guard.severity >= 2:
+            injection_note = (
+                f" [guard: possible injection in live page, severity={guard.severity}]"
+            )
 
         snap = {
             "url": page.url,
@@ -333,6 +385,9 @@ def _run_journey(
         except Exception as exc:
             observation = f"action errored: {exc}"
 
+        if injection_note:
+            observation += injection_note
+
         screenshot_path = str(screenshots_dir / f"journey{j_idx}_step{step}.png")
         try:
             page.screenshot(path=screenshot_path, full_page=False)
@@ -360,7 +415,58 @@ def _run_journey(
         ),
         calls,
         console_errors,
+        hydrated_title,
     )
+
+
+def _wait_for_hydration(page, timeout_s: int) -> bool:
+    """Wait for an SPA shell to hydrate into real content.
+
+    Streamlit/React apps serve a bootstrap shell (body == "You need to enable
+    JavaScript to run this app.") that the verifier would otherwise snapshot as
+    an empty page. Poll until the body has real content or the app signals
+    readiness. Returns True if a JS-app shell was observed at any point (used to
+    widen the step budget). Tolerates timeouts: never raises.
+    """
+    js_shell_detected = False
+    try:
+        page.wait_for_load_state("networkidle", timeout=timeout_s * 1000)
+    except Exception:
+        pass
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            state = page.evaluate(
+                """
+                () => ({
+                  text: (document.body && document.body.innerText) || '',
+                  prerenderReady: window.prerenderReady === true,
+                })
+                """
+            )
+        except Exception:
+            break
+        text = (state.get("text") or "").strip()
+        if state.get("prerenderReady"):
+            return js_shell_detected
+        if _SPA_PLACEHOLDER in text or len(text) < _MIN_HYDRATED_BODY_CHARS:
+            js_shell_detected = True
+            try:
+                page.wait_for_timeout(500)
+            except Exception:
+                break
+            continue
+        return js_shell_detected
+    return js_shell_detected
+
+
+def _best_title(deploy_title: str | None, hydrated_titles: list[str]) -> str | None:
+    """Prefer a real post-hydration title over the SPA shell title."""
+    for title in hydrated_titles:
+        if title and title.strip().lower() != "streamlit":
+            return title.strip()
+    return deploy_title
 
 
 def _interactive_elements(page, limit: int = 40) -> list[dict[str, Any]]:
