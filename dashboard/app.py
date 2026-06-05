@@ -36,6 +36,41 @@ from autojudge.trace.store import get_store
 
 VERDICT_CHOICES = ["(no override)", "shortlist", "borderline", "below_threshold", "insufficient"]
 
+# Board (Stream 3) taxonomies — kept here so the filter bar and chips stay in
+# lockstep with the foundation store contract (AppType / verdict_effective).
+APP_TYPE_CHOICES = ["web", "api", "cli", "notebook", "ml_model", "mobile", "hardware", "other"]
+VERDICT_EFFECTIVE_CHOICES = [
+    "shortlist",
+    "borderline",
+    "below_threshold",
+    "insufficient",
+    "quarantined",
+]
+STATUS_CHOICES = ["pending", "running", "scored", "failed"]
+SORT_CHOICES = ["score", "app_type", "created_at", "verdict"]
+
+VERDICT_EFFECTIVE_BADGE = {
+    "shortlist": ":green-background[shortlist]",
+    "borderline": ":orange-background[borderline]",
+    "below_threshold": ":red-background[below]",
+    "insufficient": ":gray-background[insufficient]",
+    "quarantined": ":red-background[QUARANTINED]",
+}
+SHORTLIST_STATE_BADGE = {
+    "finalist": ":blue-background[FINALIST]",
+    "winner": ":violet-background[WINNER]",
+}
+
+
+def _parse_json_list(raw: Any) -> list:
+    if not raw:
+        return []
+    try:
+        val = json.loads(raw)
+        return val if isinstance(val, list) else []
+    except Exception:
+        return []
+
 
 def _judge_identity() -> str:
     """Best-effort identity for override audit.
@@ -99,6 +134,34 @@ def _leaderboard_df(include_anchors: bool) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+@st.cache_data(ttl=10)
+def _leaderboard_rows(
+    include_anchors: bool,
+    *,
+    app_types: tuple[str, ...] | None,
+    verdict: tuple[str, ...] | None,
+    status: tuple[str, ...] | None,
+    has_live_url: bool | None,
+    finalist_only: bool,
+    search: str | None,
+    sort: str,
+) -> list[dict[str, Any]]:
+    """Board fetch — pushes every filter into the store (no Python re-filter).
+
+    Tuples (not lists) for the cache key so Streamlit can hash the args.
+    """
+    return store.leaderboard(
+        include_anchors=include_anchors,
+        app_types=list(app_types) if app_types else None,
+        verdict=list(verdict) if verdict else None,
+        status=list(status) if status else None,
+        has_live_url=has_live_url,
+        finalist_only=finalist_only,
+        search=search or None,
+        sort=sort,
+    )
+
+
 def _provider_panel() -> None:
     primary = settings.autojudge_primary_provider
     fallback = settings.autojudge_fallback_provider or "(none)"
@@ -123,109 +186,118 @@ def _provider_panel() -> None:
 
 
 def render_leaderboard() -> None:
-    st.header("Leaderboard")
+    st.header("Judge board")
+    st.caption(
+        "Filter, scan, and shortlist entirely from here — no drill-down "
+        "required. The Submission detail tab remains for optional audit."
+    )
     _provider_panel()
 
-    col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
-    with col1:
+    # --- filter / sort control bar (pushed straight into leaderboard(...)) ---
+    fc1, fc2, fc3 = st.columns([2, 2, 2])
+    with fc1:
+        sel_app_types = st.multiselect("App type", APP_TYPE_CHOICES, key="board_app_types")
+    with fc2:
+        sel_verdicts = st.multiselect(
+            "Verdict (effective)", VERDICT_EFFECTIVE_CHOICES, key="board_verdicts"
+        )
+    with fc3:
+        sel_status = st.multiselect("Status", STATUS_CHOICES, key="board_status")
+
+    fc4, fc5, fc6, fc7 = st.columns([2, 1, 1, 1])
+    with fc4:
+        search = st.text_input(
+            "Search candidate / team", key="board_search", placeholder="name or team…"
+        )
+    with fc5:
+        sort = st.selectbox("Sort by", SORT_CHOICES, index=0, key="board_sort")
+    with fc6:
+        live_only = st.checkbox("Live URL only", value=False, key="board_live_only")
+    with fc7:
+        finalist_only = st.checkbox("Finalists only", value=False, key="board_finalist_only")
+
+    bc1, bc2, bc3, bc4 = st.columns([1, 1, 1, 1])
+    with bc1:
         include_anchors = st.checkbox("Include calibration anchors", value=False)
-    with col2:
-        top_n = st.number_input("Top N", min_value=3, max_value=50, value=10, step=1)
-    with col3:
+    with bc2:
+        top_n = st.number_input("Top N", min_value=3, max_value=200, value=10, step=1)
+    with bc3:
         if st.button("Refresh"):
+            _leaderboard_rows.clear()
             _leaderboard_df.clear()
             st.rerun()
-    with col4:
+    with bc4:
         auto_refresh = st.checkbox(
             "Auto-refresh while running",
             value=False,
             help="Re-render every 5s when any submission is in the RUNNING state.",
         )
 
-    df = _leaderboard_df(include_anchors)
-    if df.empty:
-        st.info("No submissions yet.")
+    rows = _leaderboard_rows(
+        include_anchors,
+        app_types=tuple(sel_app_types) or None,
+        verdict=tuple(sel_verdicts) or None,
+        status=tuple(sel_status) or None,
+        has_live_url=True if live_only else None,
+        finalist_only=finalist_only,
+        search=search.strip() or None,
+        sort=sort,
+    )
+    if not rows:
+        st.info("No submissions match the current filters.")
         return
 
-    display = df.copy()
-    if "shortlist_rank" in display.columns:
-        display = display.rename(columns={"shortlist_rank": "rank"})
-    else:
-        display["rank"] = range(1, len(display) + 1)
+    # --- compact scan table (read-only) over the filtered, store-sorted rows ---
+    judge_identity = _judge_identity()
+    st.caption(f"Acting as `{judge_identity}` for shortlist actions.")
 
-    def _count_review_items(raw: Any) -> int:
-        if not raw:
-            return 0
-        try:
-            return len(json.loads(raw))
-        except Exception:
-            return 0
-
-    if "judge_review_items_json" in display.columns:
-        display["judge_review_items"] = display["judge_review_items_json"].map(_count_review_items)
-    if "verdict_effective" in display.columns:
-        def _decorate(row: pd.Series) -> str:
-            eff = row.get("verdict_effective") or row.get("verdict") or "—"
-            if row.get("verdict_override"):
-                return f"{eff}*"
-            return eff
-
-        display["verdict"] = display.apply(_decorate, axis=1)
-
-    # Editable selection column so judges can pick the rows to (re)evaluate.
-    display.insert(0, "select", False)
-    columns = [
-        "select",
-        "rank",
-        "id",
-        "candidate_name",
-        "team",
-        "archetype",
-        "total_score",
-        "verdict",
-        "judge_review_items",
-        "evaluable_weight",
-        "normalized",
-        "status",
-        "is_anchor",
-    ]
-    display = display[[c for c in columns if c in display.columns]]
-    edited = st.data_editor(
-        display,
+    table_rows = []
+    for idx, r in enumerate(rows, start=1):
+        flags = _parse_json_list(r.get("integrity_flags_json"))
+        quarantined = r.get("verdict_effective") == "quarantined" or bool(flags)
+        eff = r.get("verdict_effective") or r.get("verdict") or "—"
+        if r.get("verdict_override"):
+            eff = f"{eff}*"
+        table_rows.append(
+            {
+                "rank": r.get("shortlist_rank") or idx,
+                "id": r.get("id"),
+                "candidate": r.get("candidate_name"),
+                "team": r.get("team") or "solo",
+                "app_type": r.get("app_type") or "—",
+                "score": r.get("total_score"),
+                "verdict": eff,
+                "shortlist": r.get("shortlist_state") or "none",
+                "live": bool(r.get("live_url")),
+                "integrity": "⚠" if quarantined else "",
+                "review_items": len(_parse_json_list(r.get("judge_review_items_json"))),
+                "status": r.get("status"),
+            }
+        )
+    st.dataframe(
+        pd.DataFrame(table_rows),
         use_container_width=True,
         hide_index=True,
         column_config={
-            "select": st.column_config.CheckboxColumn(
-                "Run",
-                help="Tick to include this submission in 'Evaluate selected'.",
-                default=False,
-            ),
-            "id": st.column_config.TextColumn(disabled=True),
-            "candidate_name": st.column_config.TextColumn(disabled=True),
-            "team": st.column_config.TextColumn(disabled=True),
-            "archetype": st.column_config.TextColumn(disabled=True),
-            "total_score": st.column_config.NumberColumn(disabled=True),
-            "verdict": st.column_config.TextColumn(disabled=True),
-            "judge_review_items": st.column_config.NumberColumn(disabled=True),
-            "evaluable_weight": st.column_config.NumberColumn(disabled=True),
-            "normalized": st.column_config.NumberColumn(disabled=True),
-            "status": st.column_config.TextColumn(disabled=True),
-            "is_anchor": st.column_config.CheckboxColumn(disabled=True),
-            "rank": st.column_config.NumberColumn(disabled=True),
+            "score": st.column_config.NumberColumn(format="%.2f"),
+            "live": st.column_config.CheckboxColumn("live"),
         },
-        key="leaderboard_editor",
     )
-    selected_ids = edited.loc[edited["select"] == True, "id"].tolist()  # noqa: E712
     st.caption(
-        "AutoJudge is a Shortlist Generator. Verdicts are recommendations — "
-        "human judges make the final call on the shortlisted candidates. "
-        "An asterisk (`*`) marks a judge-overridden verdict."
+        "AutoJudge is a Shortlist Generator — verdicts are recommendations. "
+        "An asterisk (`*`) marks a judge-overridden verdict; ⚠ flags "
+        "quarantine/integrity. Open a row below for dimension chips and to "
+        "mark finalist/winner."
     )
 
-    _evaluate_panel(selected_ids, all_ids=edited["id"].tolist())
+    # --- per-row expander: full evidence + inline shortlist actions ---
+    st.markdown("### Decide from the board")
+    for r in rows:
+        _render_board_row(r, judge_identity)
 
-    top_subset = edited.drop(columns=["select"]).head(top_n)
-    csv = top_subset.to_csv(index=False)
+    _evaluate_panel([], all_ids=[r.get("id") for r in rows])
+
+    csv = pd.DataFrame(table_rows).head(top_n).to_csv(index=False)
     st.download_button(
         "Export top-N as CSV",
         data=csv,
@@ -233,14 +305,95 @@ def render_leaderboard() -> None:
         mime="text/csv",
     )
 
-    if auto_refresh and any(
-        (s or "").lower() == "running" for s in edited["status"].tolist()
-    ):
+    if auto_refresh and any((r.get("status") or "").lower() == "running" for r in rows):
         import time as _time
 
         _time.sleep(5)
+        _leaderboard_rows.clear()
         _leaderboard_df.clear()
         st.rerun()
+
+
+def _render_board_row(r: dict[str, Any], judge_identity: str) -> None:
+    """One submission, fully decided-from-here: chips + shortlist buttons."""
+    sid = r.get("id")
+    eff = r.get("verdict_effective") or r.get("verdict") or "—"
+    flags = _parse_json_list(r.get("integrity_flags_json"))
+    review_items = _parse_json_list(r.get("judge_review_items_json"))
+    quarantined = eff == "quarantined" or bool(flags)
+    shortlist_state = r.get("shortlist_state") or "none"
+    rank = r.get("shortlist_rank")
+    score = _fmt_score(r.get("total_score"))
+
+    state_tag = SHORTLIST_STATE_BADGE.get(shortlist_state, "")
+    header = (
+        f"#{rank if rank is not None else '—'}  ·  {r.get('candidate_name')} "
+        f"({r.get('team') or 'solo'})  ·  {score}  ·  {eff}"
+        + (f"  ·  {shortlist_state.upper()}" if state_tag else "")
+        + ("  ·  ⚠" if quarantined else "")
+    )
+    with st.expander(header, expanded=False):
+        chips = [
+            f":blue-background[{r.get('app_type') or '—'}]",
+            VERDICT_EFFECTIVE_BADGE.get(eff, eff),
+        ]
+        if state_tag:
+            chips.append(state_tag)
+        if quarantined:
+            chips.append(":red-background[INTEGRITY]")
+        st.markdown("  ".join(chips))
+
+        meta = st.columns(4)
+        meta[0].metric("Total", score)
+        meta[1].metric("Evaluable wt", f"{r.get('evaluable_weight', 100)}/100")
+        meta[2].metric("Review items", len(review_items))
+        meta[3].metric("Live URL", "yes" if r.get("live_url") else "no")
+
+        # Six dimension chips (— for None / insufficient).
+        dims = r.get("dimensions") or {}
+        dim_chips = []
+        for dim in DIMENSIONS:
+            v = dims.get(dim.id.value) if isinstance(dims, dict) else None
+            label = f"{v:.1f}" if isinstance(v, (int, float)) else "—"
+            dim_chips.append(f"**{dim.name}** `{label}`")
+        st.markdown("  ·  ".join(dim_chips))
+
+        if quarantined and flags:
+            st.warning("Integrity flags:\n" + "\n".join(f"- {f}" for f in flags))
+        if review_items:
+            st.caption(f"{len(review_items)} judge-review item(s) deferred to humans.")
+        if r.get("summary"):
+            st.write(r["summary"])
+        if r.get("repo_url"):
+            st.caption(f"Repo: {r['repo_url']}")
+        if r.get("live_url"):
+            st.caption(f"Live: {r['live_url']}")
+        if r.get("judge_notes"):
+            st.info(f"Judge notes: {r['judge_notes']}")
+
+        st.markdown(
+            f"Shortlist state: **{shortlist_state}**"
+            + (f"  (by `{r.get('finalized_by')}`)" if r.get("finalized_by") else "")
+        )
+        ac1, ac2, ac3, _ = st.columns([1, 1, 1, 3])
+        with ac1:
+            if st.button("Mark finalist", key=f"finalist-{sid}", disabled=shortlist_state == "finalist"):
+                store.set_finalist(sid, state="finalist", finalized_by=judge_identity)
+                _leaderboard_rows.clear()
+                _leaderboard_df.clear()
+                st.rerun()
+        with ac2:
+            if st.button("Mark winner", key=f"winner-{sid}", type="primary", disabled=shortlist_state == "winner"):
+                store.set_finalist(sid, state="winner", finalized_by=judge_identity)
+                _leaderboard_rows.clear()
+                _leaderboard_df.clear()
+                st.rerun()
+        with ac3:
+            if st.button("Clear", key=f"clear-finalist-{sid}", disabled=shortlist_state == "none"):
+                store.set_finalist(sid, state="none", finalized_by=judge_identity)
+                _leaderboard_rows.clear()
+                _leaderboard_df.clear()
+                st.rerun()
 
 
 def _evaluate_panel(selected_ids: list[str], *, all_ids: list[str]) -> None:
