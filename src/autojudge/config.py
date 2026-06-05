@@ -65,6 +65,7 @@ class Settings(BaseSettings):
     autojudge_browser_headless: bool = True
     autojudge_browser_timeout_s: int = 45
     autojudge_browser_max_steps: int = 12
+    autojudge_browser_max_steps_spa: int = 20
 
     autojudge_submission_timeout_s: int = 900
     autojudge_snapshot_ttl_days: int = 14
