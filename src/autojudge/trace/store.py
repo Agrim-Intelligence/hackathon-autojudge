@@ -44,6 +44,91 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _artifacts_extras(sub: Submission) -> dict[str, Any]:
+    """Serialise the free-form / type-specific artifact fields into extras_json.
+
+    These fields have no dedicated columns; they ride along in the JSON blob so
+    both backends stay schema-light. App-typed prober inputs (api_endpoints,
+    declared_journeys) round-trip as lists of dicts.
+    """
+    a = sub.artifacts
+    return {
+        "submission_md_path": a.submission_md_path,
+        "test_credentials": a.test_credentials,
+        "api_base_url": a.api_base_url,
+        "api_endpoints": [e.model_dump() for e in a.api_endpoints],
+        "cli_command": a.cli_command,
+        "notebook_path": a.notebook_path,
+        "declared_journeys": [j.model_dump() for j in a.declared_journeys],
+    }
+
+
+# Shared leaderboard SQL — identical across backends except the ``%s`` vs ``?``
+# placeholder style, which is substituted in ``_leaderboard_filters``. The
+# ``verdict_effective`` expression mirrors the read-time COALESCE so the verdict
+# filter matches what the dashboard displays.
+_LEADERBOARD_SELECT = """
+    SELECT s.id, s.candidate_name, s.team, s.archetype, s.app_type, s.status,
+           s.repo_url, s.live_url, s.is_anchor, s.created_at,
+           t.total_score, t.summary, t.integrity_flags_json,
+           t.evaluable_weight, t.normalized, t.verdict,
+           t.judge_review_items_json,
+           t.verdict_override, t.judge_notes,
+           t.overridden_by, t.overridden_at,
+           t.shortlist_state, t.finalized_by, t.finalized_at_shortlist
+    FROM submissions s
+    LEFT JOIN totals t ON s.id = t.submission_id
+"""
+
+
+def _leaderboard_filters(
+    ph: str,
+    include_anchors: bool,
+    app_types: list[str] | None,
+    verdict: str | None,
+    status: str | None,
+    has_live_url: bool | None,
+    finalist_only: bool,
+    search: str | None,
+) -> tuple[list[str], list[Any]]:
+    """Build parameterized WHERE clauses for both dialects. ``ph`` is ``?`` or ``%s``."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if not include_anchors:
+        clauses.append("s.is_anchor = 0")
+    if app_types:
+        marks = ",".join(ph for _ in app_types)
+        clauses.append(f"s.app_type IN ({marks})")
+        params.extend(app_types)
+    if verdict:
+        clauses.append(f"COALESCE(t.verdict_override, t.verdict) = {ph}")
+        params.append(verdict)
+    if status:
+        clauses.append(f"s.status = {ph}")
+        params.append(status)
+    if has_live_url is True:
+        clauses.append("s.live_url IS NOT NULL")
+    elif has_live_url is False:
+        clauses.append("s.live_url IS NULL")
+    if finalist_only:
+        clauses.append("t.shortlist_state IN ('finalist', 'winner')")
+    if search:
+        clauses.append(f"(LOWER(s.candidate_name) LIKE {ph} OR LOWER(s.team) LIKE {ph})")
+        like = f"%{search.lower()}%"
+        params.extend([like, like])
+    return clauses, params
+
+
+def _leaderboard_order(sort: str) -> str:
+    if sort == "app_type":
+        return " ORDER BY s.app_type, t.total_score DESC NULLS LAST"
+    if sort == "created_at":
+        return " ORDER BY s.created_at DESC"
+    if sort == "verdict":
+        return " ORDER BY COALESCE(t.verdict_override, t.verdict), t.total_score DESC NULLS LAST"
+    return " ORDER BY t.total_score DESC NULLS LAST"
+
+
 @runtime_checkable
 class TraceStoreProtocol(Protocol):
     """Narrow contract every trace-store backend must satisfy.
@@ -62,6 +147,12 @@ class TraceStoreProtocol(Protocol):
     def set_status(self, submission_id: str, status: SubmissionStatus) -> None: ...
 
     def set_archetype(self, submission_id: str, archetype: str) -> None: ...
+
+    def set_app_type(self, submission_id: str, app_type: str) -> None: ...
+
+    def set_finalist(
+        self, submission_id: str, *, state: str, finalized_by: str | None = None
+    ) -> None: ...
 
     def set_judge_override(
         self,
@@ -85,7 +176,14 @@ class TraceStoreProtocol(Protocol):
 
     def record_total(self, rubric: RubricScore) -> None: ...
 
-    def leaderboard(self, include_anchors: bool = False) -> list[dict[str, Any]]: ...
+    def leaderboard(self, include_anchors: bool = False, *,
+                    app_types: list[str] | None = None,
+                    verdict: str | None = None,
+                    status: str | None = None,
+                    has_live_url: bool | None = None,
+                    finalist_only: bool = False,
+                    search: str | None = None,
+                    sort: str = "score") -> list[dict[str, Any]]: ...
 
     def get_submission(self, submission_id: str) -> dict[str, Any] | None: ...
 
@@ -174,9 +272,9 @@ class TraceStore:
                 INSERT INTO submissions (
                     id, candidate_name, candidate_email, team,
                     repo_url, live_url, video_url, deck_path,
-                    archetype, status, is_anchor, created_at, extras_json,
+                    archetype, app_type, status, is_anchor, created_at, extras_json,
                     submission_md_raw
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     candidate_name = excluded.candidate_name,
                     candidate_email = excluded.candidate_email,
@@ -186,6 +284,7 @@ class TraceStore:
                     video_url = excluded.video_url,
                     deck_path = excluded.deck_path,
                     archetype = excluded.archetype,
+                    app_type = excluded.app_type,
                     status = excluded.status,
                     is_anchor = excluded.is_anchor,
                     extras_json = excluded.extras_json,
@@ -201,15 +300,11 @@ class TraceStore:
                     sub.artifacts.video_url,
                     sub.artifacts.deck_path,
                     sub.archetype.value,
+                    sub.app_type.value,
                     sub.status.value,
                     1 if sub.is_anchor else 0,
                     sub.created_at.isoformat(),
-                    json.dumps(
-                        {
-                            "submission_md_path": sub.artifacts.submission_md_path,
-                            "test_credentials": sub.artifacts.test_credentials,
-                        }
-                    ),
+                    json.dumps(_artifacts_extras(sub)),
                     sub.submission_md_raw,
                 ),
             )
@@ -229,6 +324,48 @@ class TraceStore:
                 "UPDATE submissions SET archetype = ? WHERE id = ?",
                 (archetype, submission_id),
             )
+            conn.commit()
+
+    def set_app_type(self, submission_id: str, app_type: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE submissions SET app_type = ? WHERE id = ?",
+                (app_type, submission_id),
+            )
+            conn.commit()
+
+    def set_finalist(
+        self, submission_id: str, *, state: str, finalized_by: str | None = None
+    ) -> None:
+        """Record a judge's shortlist decision. ``state`` ∈ {none,finalist,winner}.
+
+        ``none`` clears the finalist provenance; any other state stamps it.
+        Sticky across re-scores because ``record_total`` excludes these columns
+        from its conflict update.
+        """
+        with self.connect() as conn:
+            if state == "none":
+                conn.execute(
+                    """
+                    UPDATE totals SET
+                        shortlist_state = ?,
+                        finalized_by = NULL,
+                        finalized_at_shortlist = NULL
+                    WHERE submission_id = ?
+                    """,
+                    (state, submission_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE totals SET
+                        shortlist_state = ?,
+                        finalized_by = ?,
+                        finalized_at_shortlist = ?
+                    WHERE submission_id = ?
+                    """,
+                    (state, finalized_by, _now_iso(), submission_id),
+                )
             conn.commit()
 
     def set_judge_override(
@@ -515,8 +652,10 @@ class TraceStore:
                     submission_id, total_score, archetype, summary,
                     integrity_flags_json, anchor_deltas_json,
                     evaluable_weight, normalized, verdict,
-                    judge_review_items_json, finalized_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    judge_review_items_json,
+                    shortlist_state, finalized_by, finalized_at_shortlist,
+                    finalized_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'none', NULL, NULL, ?)
                 ON CONFLICT(submission_id) DO UPDATE SET
                     total_score = excluded.total_score,
                     archetype = excluded.archetype,
@@ -547,23 +686,24 @@ class TraceStore:
 
     # --- read helpers used by the dashboard ---
 
-    def leaderboard(self, include_anchors: bool = False) -> list[dict[str, Any]]:
+    def leaderboard(self, include_anchors: bool = False, *,
+                    app_types: list[str] | None = None,
+                    verdict: str | None = None,
+                    status: str | None = None,
+                    has_live_url: bool | None = None,
+                    finalist_only: bool = False,
+                    search: str | None = None,
+                    sort: str = "score") -> list[dict[str, Any]]:
+        clauses, params = _leaderboard_filters(
+            "?", include_anchors, app_types, verdict, status,
+            has_live_url, finalist_only, search,
+        )
+        sql = _LEADERBOARD_SELECT
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += _leaderboard_order(sort)
         with self.connect() as conn:
-            sql = """
-                SELECT s.id, s.candidate_name, s.team, s.archetype, s.status,
-                       s.repo_url, s.live_url, s.is_anchor,
-                       t.total_score, t.summary, t.integrity_flags_json,
-                       t.evaluable_weight, t.normalized, t.verdict,
-                       t.judge_review_items_json,
-                       t.verdict_override, t.judge_notes,
-                       t.overridden_by, t.overridden_at
-                FROM submissions s
-                LEFT JOIN totals t ON s.id = t.submission_id
-            """
-            if not include_anchors:
-                sql += " WHERE s.is_anchor = 0"
-            sql += " ORDER BY t.total_score DESC NULLS LAST"
-            rows = conn.execute(sql).fetchall()
+            rows = conn.execute(sql, params).fetchall()
             out: list[dict[str, Any]] = []
             for idx, r in enumerate(rows, start=1):
                 d = dict(r)
@@ -576,6 +716,19 @@ class TraceStore:
                 # rows. Anchors get no rank.
                 d["shortlist_rank"] = idx if not d.get("is_anchor") else None
                 out.append(d)
+            ids = [d["id"] for d in out]
+            dims: dict[str, dict[str, float | None]] = {}
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                srows = conn.execute(
+                    f"SELECT submission_id, dimension, raw_score FROM scores "
+                    f"WHERE submission_id IN ({placeholders})",
+                    ids,
+                ).fetchall()
+                for sr in srows:
+                    dims.setdefault(sr["submission_id"], {})[sr["dimension"]] = sr["raw_score"]
+            for d in out:
+                d["dimensions"] = dims.get(d["id"], {})
             return out
 
     def get_submission(self, submission_id: str) -> dict[str, Any] | None:

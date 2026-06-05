@@ -38,6 +38,12 @@ from ..models import (
     VerifierRun,
 )
 from .schema import SCHEMA_POSTGRES
+from .store import (
+    _artifacts_extras,
+    _LEADERBOARD_SELECT,
+    _leaderboard_filters,
+    _leaderboard_order,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +67,10 @@ _POSTGRES_COLUMN_ADDS: list[tuple[str, str, str]] = [
     ("totals", "overridden_by", "TEXT"),
     ("totals", "overridden_at", "TEXT"),
     ("submissions", "submission_md_raw", "TEXT"),
+    ("submissions", "app_type", "TEXT DEFAULT 'other'"),
+    ("totals", "shortlist_state", "TEXT DEFAULT 'none'"),
+    ("totals", "finalized_by", "TEXT"),
+    ("totals", "finalized_at_shortlist", "TEXT"),
 ]
 
 
@@ -142,9 +152,9 @@ class PostgresTraceStore:
                     INSERT INTO submissions (
                         id, candidate_name, candidate_email, team,
                         repo_url, live_url, video_url, deck_path,
-                        archetype, status, is_anchor, created_at, extras_json,
+                        archetype, app_type, status, is_anchor, created_at, extras_json,
                         submission_md_raw
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (id) DO UPDATE SET
                         candidate_name = EXCLUDED.candidate_name,
                         candidate_email = EXCLUDED.candidate_email,
@@ -154,6 +164,7 @@ class PostgresTraceStore:
                         video_url = EXCLUDED.video_url,
                         deck_path = EXCLUDED.deck_path,
                         archetype = EXCLUDED.archetype,
+                        app_type = EXCLUDED.app_type,
                         status = EXCLUDED.status,
                         is_anchor = EXCLUDED.is_anchor,
                         extras_json = EXCLUDED.extras_json,
@@ -169,15 +180,11 @@ class PostgresTraceStore:
                         sub.artifacts.video_url,
                         sub.artifacts.deck_path,
                         sub.archetype.value,
+                        sub.app_type.value,
                         sub.status.value,
                         1 if sub.is_anchor else 0,
                         sub.created_at.isoformat(),
-                        json.dumps(
-                            {
-                                "submission_md_path": sub.artifacts.submission_md_path,
-                                "test_credentials": sub.artifacts.test_credentials,
-                            }
-                        ),
+                        json.dumps(_artifacts_extras(sub)),
                         sub.submission_md_raw,
                     ),
                 )
@@ -197,6 +204,48 @@ class PostgresTraceStore:
                     "UPDATE submissions SET archetype = %s WHERE id = %s",
                     (archetype, submission_id),
                 )
+
+    def set_app_type(self, submission_id: str, app_type: str) -> None:
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE submissions SET app_type = %s WHERE id = %s",
+                    (app_type, submission_id),
+                )
+
+    def set_finalist(
+        self, submission_id: str, *, state: str, finalized_by: str | None = None
+    ) -> None:
+        """Record a judge's shortlist decision. ``state`` ∈ {none,finalist,winner}.
+
+        ``none`` clears the finalist provenance; any other state stamps it.
+        Sticky across re-scores because ``record_total`` excludes these columns
+        from its conflict update.
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                if state == "none":
+                    cur.execute(
+                        """
+                        UPDATE totals SET
+                            shortlist_state = %s,
+                            finalized_by = NULL,
+                            finalized_at_shortlist = NULL
+                        WHERE submission_id = %s
+                        """,
+                        (state, submission_id),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        UPDATE totals SET
+                            shortlist_state = %s,
+                            finalized_by = %s,
+                            finalized_at_shortlist = %s
+                        WHERE submission_id = %s
+                        """,
+                        (state, finalized_by, _now_iso(), submission_id),
+                    )
 
     def set_judge_override(
         self,
@@ -450,8 +499,10 @@ class PostgresTraceStore:
                         submission_id, total_score, archetype, summary,
                         integrity_flags_json, anchor_deltas_json,
                         evaluable_weight, normalized, verdict,
-                        judge_review_items_json, finalized_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        judge_review_items_json,
+                        shortlist_state, finalized_by, finalized_at_shortlist,
+                        finalized_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'none', NULL, NULL, %s)
                     ON CONFLICT (submission_id) DO UPDATE SET
                         total_score = EXCLUDED.total_score,
                         archetype = EXCLUDED.archetype,
@@ -526,24 +577,25 @@ class PostgresTraceStore:
 
     # ---- read API -----------------------------------------------------------
 
-    def leaderboard(self, include_anchors: bool = False) -> list[dict[str, Any]]:
+    def leaderboard(self, include_anchors: bool = False, *,
+                    app_types: list[str] | None = None,
+                    verdict: str | None = None,
+                    status: str | None = None,
+                    has_live_url: bool | None = None,
+                    finalist_only: bool = False,
+                    search: str | None = None,
+                    sort: str = "score") -> list[dict[str, Any]]:
+        clauses, params = _leaderboard_filters(
+            "%s", include_anchors, app_types, verdict, status,
+            has_live_url, finalist_only, search,
+        )
+        sql = _LEADERBOARD_SELECT
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += _leaderboard_order(sort)
         with self._conn() as conn:
             with conn.cursor() as cur:
-                sql = """
-                    SELECT s.id, s.candidate_name, s.team, s.archetype, s.status,
-                           s.repo_url, s.live_url, s.is_anchor,
-                           t.total_score, t.summary, t.integrity_flags_json,
-                           t.evaluable_weight, t.normalized, t.verdict,
-                           t.judge_review_items_json,
-                           t.verdict_override, t.judge_notes,
-                           t.overridden_by, t.overridden_at
-                    FROM submissions s
-                    LEFT JOIN totals t ON s.id = t.submission_id
-                """
-                if not include_anchors:
-                    sql += " WHERE s.is_anchor = 0"
-                sql += " ORDER BY t.total_score DESC NULLS LAST"
-                cur.execute(sql)
+                cur.execute(sql, params)
                 rows = cur.fetchall()
             out: list[dict[str, Any]] = []
             for idx, r in enumerate(rows, start=1):
@@ -551,6 +603,19 @@ class PostgresTraceStore:
                 d["verdict_effective"] = d.get("verdict_override") or d.get("verdict")
                 d["shortlist_rank"] = idx if not d.get("is_anchor") else None
                 out.append(d)
+            ids = [d["id"] for d in out]
+            dims: dict[str, dict[str, float | None]] = {}
+            if ids:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT submission_id, dimension, raw_score FROM scores "
+                        "WHERE submission_id = ANY(%s)",
+                        (ids,),
+                    )
+                    for sr in cur.fetchall():
+                        dims.setdefault(sr["submission_id"], {})[sr["dimension"]] = sr["raw_score"]
+            for d in out:
+                d["dimensions"] = dims.get(d["id"], {})
             return out
 
     def get_submission(self, submission_id: str) -> dict[str, Any] | None:

@@ -31,7 +31,10 @@ import streamlit as st
 from autojudge.auth import require_basic_auth
 from autojudge.config import get_settings
 from autojudge.models import (
+    ApiEndpoint,
+    AppType,
     CandidateInfo,
+    DeclaredJourney,
     Submission,
     SubmissionArtifacts,
     SubmissionStatus,
@@ -50,6 +53,46 @@ def _slug(text: str) -> str:
 def _gen_id(name: str) -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     return f"{stamp}-{_slug(name)}"
+
+
+_VERB_RE = re.compile(r"^(GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS)$", re.IGNORECASE)
+
+
+def _parse_endpoints(text: str) -> list[ApiEndpoint]:
+    """Parse ``METHOD /path [expected_status]`` lines, lenient on shape.
+
+    A bare ``/path`` defaults to GET. A trailing integer token is the expected
+    status. Unrecognised leading tokens are treated as the path (method GET).
+    """
+    out: list[ApiEndpoint] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        toks = line.split()
+        method = "GET"
+        if _VERB_RE.match(toks[0]):
+            method = toks.pop(0).upper()
+        if not toks:
+            continue
+        status: int | None = None
+        if toks[-1].isdigit():
+            status = int(toks.pop())
+        if not toks:
+            continue
+        out.append(ApiEndpoint(method=method, path=toks[0], expected_status=status))
+    return out
+
+
+def _parse_journeys(text: str) -> list[DeclaredJourney]:
+    """Parse blank-line-separated blocks: first line = name, rest = steps."""
+    out: list[DeclaredJourney] = []
+    for block in re.split(r"\n\s*\n", text.strip()):
+        lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+        if not lines:
+            continue
+        out.append(DeclaredJourney(name=lines[0], steps=lines[1:]))
+    return out
 
 
 def main() -> None:
@@ -101,6 +144,31 @@ def main() -> None:
             height=80,
         )
         deck_file = st.file_uploader("Slide deck (PDF, optional)", type=["pdf"])
+
+        st.subheader("App type")
+        app_type_value = st.selectbox(
+            "What kind of app is this?",
+            options=[t.value for t in AppType],
+            index=list(AppType).index(AppType.WEB),
+        )
+
+        st.subheader("Type-specific details (optional)")
+        st.caption(
+            "Fill in whatever matches your app — the auto-judge uses these to "
+            "probe the right surface. Leave the rest blank."
+        )
+        api_base_url = st.text_input("API base URL")
+        api_endpoints_raw = st.text_area(
+            "API endpoints (one per line: `METHOD /path [expected_status]`)",
+            height=100,
+        )
+        cli_command = st.text_input("CLI command to run")
+        notebook_path = st.text_input("Notebook path (in repo)")
+        journeys_raw = st.text_area(
+            "User journeys to test (one per block; first line = name, "
+            "remaining lines = steps; separate journeys with a blank line)",
+            height=120,
+        )
 
         st.subheader("Free-form context (optional)")
         st.markdown(
@@ -168,6 +236,7 @@ def main() -> None:
         "video_url": video_url.strip() or None,
         "deck_path": deck_path_str,
         "test_credentials": test_credentials.strip() or None,
+        "app_type": app_type_value,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -181,7 +250,13 @@ def main() -> None:
             video_url=meta["video_url"],
             deck_path=deck_path_str,
             test_credentials=meta["test_credentials"],
+            api_base_url=api_base_url.strip() or None,
+            api_endpoints=_parse_endpoints(api_endpoints_raw),
+            cli_command=cli_command.strip() or None,
+            notebook_path=notebook_path.strip() or None,
+            declared_journeys=_parse_journeys(journeys_raw),
         ),
+        app_type=AppType(app_type_value),
         submission_md_raw=body,
         status=SubmissionStatus.PENDING,
     )

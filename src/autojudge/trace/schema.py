@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS submissions (
     video_url TEXT,
     deck_path TEXT,
     archetype TEXT DEFAULT 'unknown',
+    app_type TEXT DEFAULT 'other',
     status TEXT DEFAULT 'pending',
     is_anchor INTEGER DEFAULT 0,
     created_at TEXT NOT NULL,
@@ -105,6 +106,9 @@ CREATE TABLE IF NOT EXISTS totals (
     judge_notes TEXT,
     overridden_by TEXT,
     overridden_at TEXT,
+    shortlist_state TEXT DEFAULT 'none',
+    finalized_by TEXT,
+    finalized_at_shortlist TEXT,
     finalized_at TEXT NOT NULL,
     FOREIGN KEY (submission_id) REFERENCES submissions(id)
 );
@@ -123,6 +127,10 @@ MIGRATIONS_SQLITE: list[str] = [
     "ALTER TABLE totals ADD COLUMN overridden_by TEXT",
     "ALTER TABLE totals ADD COLUMN overridden_at TEXT",
     "ALTER TABLE submissions ADD COLUMN submission_md_raw TEXT",
+    "ALTER TABLE submissions ADD COLUMN app_type TEXT DEFAULT 'other'",
+    "ALTER TABLE totals ADD COLUMN shortlist_state TEXT DEFAULT 'none'",
+    "ALTER TABLE totals ADD COLUMN finalized_by TEXT",
+    "ALTER TABLE totals ADD COLUMN finalized_at_shortlist TEXT",
 ]
 
 # Rebuild block: SQLite can't drop NOT NULL via ALTER COLUMN, so when we detect
@@ -186,6 +194,7 @@ CREATE TABLE IF NOT EXISTS submissions (
     video_url TEXT,
     deck_path TEXT,
     archetype TEXT DEFAULT 'unknown',
+    app_type TEXT DEFAULT 'other',
     status TEXT DEFAULT 'pending',
     is_anchor INTEGER DEFAULT 0,
     created_at TEXT NOT NULL,
@@ -255,6 +264,9 @@ CREATE TABLE IF NOT EXISTS totals (
     judge_notes TEXT,
     overridden_by TEXT,
     overridden_at TEXT,
+    shortlist_state TEXT DEFAULT 'none',
+    finalized_by TEXT,
+    finalized_at_shortlist TEXT,
     finalized_at TEXT NOT NULL
 );
 """
