@@ -157,25 +157,43 @@ def verify(
                 ),
                 [],
             )
+        attempts = max(1, settings.autojudge_browser_journey_attempts)
         try:
             for j_idx, journey in enumerate(journeys):
-                result, calls, errs, hydrated_title = _run_journey(
-                    browser=browser,
-                    journey=journey,
-                    j_idx=j_idx,
-                    live_url=live_url,
-                    test_credentials=test_credentials,
-                    screenshots_dir=screenshots_dir,
-                    settings=settings,
-                    llm=llm,
-                    system_prompt=system,
-                    archetype=archetype,
-                )
+                # Retry a failed journey: the LLM driver is nondeterministic and
+                # can exhaust its step budget on a working app. Keep the first
+                # success; stop retrying once a journey is auth-blocked (a settled
+                # outcome) or succeeds.
+                result = None
+                for attempt in range(attempts):
+                    result, calls, errs, hydrated_title = _run_journey(
+                        browser=browser,
+                        journey=journey,
+                        j_idx=j_idx,
+                        live_url=live_url,
+                        test_credentials=test_credentials,
+                        screenshots_dir=screenshots_dir,
+                        settings=settings,
+                        llm=llm,
+                        system_prompt=system,
+                        archetype=archetype,
+                    )
+                    llm_calls.extend(calls)
+                    console_errors.extend(errs)
+                    if hydrated_title:
+                        hydrated_titles.append(hydrated_title)
+                    # Stop on success, on a settled auth block, or on a
+                    # deliberate negative (the agent called done success=false
+                    # with a real observation) — only retry transient/flaky
+                    # failures (budget exhausted, navigation/snapshot/LLM error).
+                    if result.success or _journey_blocked_by_auth(result) or not _is_flaky_failure(result):
+                        break
+                    if attempt + 1 < attempts:
+                        logger.info(
+                            "[%s] journey '%s' failed (attempt %d/%d) — retrying",
+                            submission_id, journey.name, attempt + 1, attempts,
+                        )
                 journey_results.append(result)
-                llm_calls.extend(calls)
-                console_errors.extend(errs)
-                if hydrated_title:
-                    hydrated_titles.append(hydrated_title)
         finally:
             browser.close()
 
@@ -301,11 +319,13 @@ def _run_journey(
                 f" [guard: possible injection in live page, severity={guard.severity}]"
             )
 
-        snap = {
-            "url": page.url,
-            "title": page.title(),
-            "elements": elements,
-        }
+        # Order matters: the page TEXT (which carries the actual content — e.g.
+        # ranked rows like "#1 · Alice · 72.8 · shortlist") goes FIRST so it is
+        # never truncated away by a long list of (often unlabeled) interactive
+        # elements. The element list follows, truncated if needed.
+        headings_txt = "; ".join(
+            h.get("text", "") for h in elements.get("headings", []) if h.get("text")
+        )
         user = (
             f"### Journey\nName: {journey.name}\nSteps:\n"
             + "\n".join(f"- {s}" for s in journey.steps)
@@ -320,8 +340,11 @@ def _run_journey(
                 )
                 or "(none yet)"
             )
-            + "\n\n### Current page state\n"
-            + json.dumps(snap, indent=2)[:6000]
+            + f"\n\n### Current page\nURL: {page.url}\nTitle: {page.title()}\n"
+            + f"\nVisible page text (your primary evidence):\n{(elements.get('bodyText') or '')[:3500]}\n"
+            + (f"\nHeadings: {headings_txt}\n" if headings_txt else "")
+            + "\nInteractive elements (use `ref` to click/type):\n"
+            + json.dumps(elements.get("interactive", []), indent=2)[:4500]
         )
 
         try:
@@ -511,7 +534,7 @@ def _interactive_elements(page, limit: int = 40) -> list[dict[str, Any]]:
       const headings = Array.from(document.querySelectorAll('h1, h2, h3')).slice(0, 6).map(h => ({
         ref: -1, tag: h.tagName.toLowerCase(), text: (h.innerText || '').trim().slice(0, 120)
       }));
-      return { interactive: out, headings: headings, bodyText: document.body.innerText.slice(0, 1200) };
+      return { interactive: out, headings: headings, bodyText: document.body.innerText.slice(0, 3000) };
     }
     """
     data = page.evaluate(js)
@@ -578,7 +601,13 @@ _AUTH_OBSERVATION = re.compile(
     re.IGNORECASE,
 )
 
-_INTERACTIVE_ACTIONS = {"click", "type", "press_enter", "goto"}
+_INTERACTIVE_ACTIONS = {"click", "type", "press_enter", "goto", "scroll"}
+
+# A page this rich is self-evidently a real, populated app view — enough to
+# ground a read-only "view/review" success even without a mutating interaction.
+# Bare/auth shells fall far below this, so the anti-hallucination guard holds.
+_SUBSTANTIAL_BODY_CHARS = 600
+_SUBSTANTIAL_INTERACTIVE = 12
 
 
 def _looks_auth_gated(elements: dict[str, Any]) -> bool:
@@ -604,10 +633,14 @@ def _grounded_success(elements: dict[str, Any], records: list[StepRecord]) -> tu
         r.action.get("action") in _INTERACTIVE_ACTIONS and "errored" not in r.observation
         for r in records
     )
-    if not interacted:
-        reasons.append("no successful interactive action was performed")
     body_len = len((elements.get("bodyText") or "").strip())
     n_interactive = len(elements.get("interactive") or [])
+    substantial = body_len >= _SUBSTANTIAL_BODY_CHARS or n_interactive >= _SUBSTANTIAL_INTERACTIVE
+    # A read-only journey is grounded by landing on a self-evidently populated
+    # app view; otherwise require a real interaction so a thin page can't be
+    # rubber-stamped.
+    if not interacted and not substantial:
+        reasons.append("no interaction and the page is not clearly a populated app view")
     if body_len < _MIN_BODY_CHARS and n_interactive < _MIN_INTERACTIVE:
         reasons.append(
             f"page has thin content (text={body_len} chars, {n_interactive} elements)"
@@ -615,6 +648,18 @@ def _grounded_success(elements: dict[str, Any], records: list[StepRecord]) -> tu
     if _looks_auth_gated(elements):
         reasons.append("page still shows a login / auth gate")
     return (not reasons, "; ".join(reasons))
+
+
+_FLAKY_FAILURE = re.compile(
+    r"step budget exhausted|navigation failed|failed to snapshot|LLM planning failed",
+    re.IGNORECASE,
+)
+
+
+def _is_flaky_failure(j: JourneyResult) -> bool:
+    """A failure worth retrying: transient/driver issues, not a deliberate
+    success=false judgment (which has no such failure_reason)."""
+    return bool(j.failure_reason and _FLAKY_FAILURE.search(j.failure_reason))
 
 
 def _journey_blocked_by_auth(j: JourneyResult) -> bool:

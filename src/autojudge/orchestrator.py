@@ -179,6 +179,25 @@ def _rebuild_from_cache(model_cls, cached: dict[str, Any]):
     return model_cls.model_validate(cached)
 
 
+def _browser_run_conclusive(cached: dict[str, Any]) -> bool:
+    """Whether a cached browser_verifier run is settled enough to resume.
+
+    A reachable, non-auth-blocked run that produced ZERO successful journeys is
+    likely flaky/incomplete (the SPA journey driver is nondeterministic and can
+    exhaust its step budget on a working app). Re-run those rather than freezing
+    a 0-success outcome; resume everything else (skipped, auth-blocked,
+    unreachable, or already has a successful journey).
+    """
+    if cached.get("skipped") or cached.get("auth_blocked"):
+        return True
+    journeys = cached.get("journey_results") or []
+    if any(j.get("success") for j in journeys):
+        return True
+    if cached.get("live_url_reachable") and journeys:
+        return False
+    return True
+
+
 def _record_failure(store, submission_id: str, step: str, exc: BaseException) -> None:
     """Write a synthetic verifier_runs row recording an orchestrator failure."""
     tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
@@ -677,7 +696,7 @@ def _run_pipeline(
         # deadline, skip and synthesise a stub; otherwise run and convert a
         # mid-run timeout into the same stub. On a requeued re-run a prior
         # successful report is rebuilt from the trace store (browser is slowest).
-        if "browser_verifier" in resume:
+        if "browser_verifier" in resume and _browser_run_conclusive(resume["browser_verifier"]):
             browser_report = _rebuild_from_cache(
                 BrowserVerifierReport, resume["browser_verifier"]
             )
