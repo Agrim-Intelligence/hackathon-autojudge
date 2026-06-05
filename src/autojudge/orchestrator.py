@@ -104,16 +104,18 @@ from .models import (
     ArchetypeReport,
     BrowserVerifierReport,
     CandidateInfo,
+    CodeAnalystReport,
     CrossCheckReport,
     GuardReport,
     InferredSubmission,
+    RubricScore,
     Submission,
     SubmissionArtifacts,
     SubmissionStatus,
     VerifierRun,
 )
 from .rubric.weights import profile_for
-from .sanitize.guard import sanitize
+from .sanitize.guard import max_injection_severity, sanitize
 from .trace.store import completed_agent_outputs, get_store
 
 logger = logging.getLogger(__name__)
@@ -654,6 +656,20 @@ def _run_pipeline(
         integrity_flags.extend(budget_flags)
     rubric_score.integrity_flags = list(dict.fromkeys(integrity_flags))
 
+    # Anti-cheat enforcement: clear cheats quarantine the submission (verdict
+    # override) so they cannot be shortlisted on score alone.
+    _apply_integrity_enforcement(
+        rubric_score,
+        guard_report=guard_report,
+        code_report=code_report,
+        inferred=inferred,
+        cross_report=cross_report,
+        repo_url=repo_url,
+        live_url=live_url,
+        store=store,
+        submission_id=submission_id,
+    )
+
     store.record_total(rubric_score)
     store.set_status(submission_id, SubmissionStatus.SCORED)
     logger.info(
@@ -662,6 +678,82 @@ def _run_pipeline(
         rubric_score.total_score,
         rubric_score.evaluable_weight,
     )
+
+
+def _apply_integrity_enforcement(
+    rubric_score: RubricScore,
+    *,
+    guard_report: GuardReport,
+    code_report: CodeAnalystReport,
+    inferred: Any,
+    cross_report: CrossCheckReport,
+    repo_url: str | None,
+    live_url: str | None,
+    store: Any,
+    submission_id: str,
+) -> None:
+    """Mutate `rubric_score.verdict` to "quarantined" for clear cheats.
+
+    Quarantine causes (any one suffices):
+    - prompt injection: guard severity >= 3 (sophisticated injection or the
+      fail-secure quarantine placeholder), or a high-severity injection on any
+      sanitized channel (recovered from the channel-sanitizers' integrity notes
+      stashed in inferred.gaps / cross_report.discrepancies).
+    - timeline cheat: zero in-window commits AND a future-dated commit history.
+
+    Also appends a lightweight `duplicate_artifact:` flag when another
+    submission already claims the same repo_url / live_url. Once set,
+    "quarantined" is never overwritten.
+    """
+    flags = list(rubric_score.integrity_flags)
+    quarantined = False
+
+    # --- Prompt injection ---
+    channel_flags = list(inferred.gaps) + [
+        str(d.get("detail", ""))
+        for d in cross_report.discrepancies
+        if isinstance(d, dict) and d.get("type") == "integrity"
+    ]
+    channel_severity = max_injection_severity(channel_flags)
+    if guard_report.severity >= 3 or channel_severity >= 3:
+        sev = max(guard_report.severity, channel_severity)
+        flags.append(f"quarantine_cause: prompt_injection severity={sev}")
+        quarantined = True
+
+    # --- Timeline cheat ---
+    metrics = code_report.metrics
+    if metrics is not None:
+        now = _now()
+        # Future-dated commits cannot exist in an honest history; treat the
+        # latest commit timestamp as the cheap signal (full per-commit dates
+        # are not surfaced on RepoMetrics).
+        future_dated = bool(metrics.last_commit_at and metrics.last_commit_at > now)
+        if future_dated:
+            flags.append("future_timestamp: commit dated in the future")
+        if metrics.commits_in_window == 0 and metrics.total_commits > 0 and future_dated:
+            flags.append(
+                "quarantine_cause: timeline — zero in-window commits + future-dated history"
+            )
+            quarantined = True
+
+    # --- Duplicate artifact (lightweight) ---
+    try:
+        existing = store.leaderboard(include_anchors=True)
+        for row in existing:
+            if row.get("id") == submission_id:
+                continue
+            if repo_url and row.get("repo_url") == repo_url:
+                flags.append(f"duplicate_artifact: repo_url shared with {row.get('id')}")
+                break
+            if live_url and row.get("live_url") == live_url:
+                flags.append(f"duplicate_artifact: live_url shared with {row.get('id')}")
+                break
+    except Exception as exc:  # pragma: no cover - duplicate check is best-effort
+        logger.warning("Duplicate-artifact check failed: %s", exc)
+
+    rubric_score.integrity_flags = list(dict.fromkeys(flags))
+    if quarantined:
+        rubric_score.verdict = "quarantined"
 
 
 def run_anchor(anchor_id: str, anchor_md_path: Path) -> Submission:

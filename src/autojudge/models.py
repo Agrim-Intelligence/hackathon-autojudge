@@ -296,7 +296,7 @@ class DimensionScore(BaseModel):
     cap_reason: str | None = None
 
 
-Verdict = Literal["shortlist", "borderline", "below_threshold", "insufficient"]
+Verdict = Literal["shortlist", "borderline", "below_threshold", "insufficient", "quarantined"]
 
 
 class RubricScore(BaseModel):
