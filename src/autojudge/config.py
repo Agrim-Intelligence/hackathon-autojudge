@@ -70,6 +70,12 @@ class Settings(BaseSettings):
     autojudge_submission_timeout_s: int = 900
     autojudge_snapshot_ttl_days: int = 14
 
+    # Bounded requeue for submissions interrupted mid-run (process killed while
+    # status='running'). Below this many restarts a stale submission is sent
+    # back to 'pending' (checkpoint resume skips completed agents); at/above it
+    # the submission is dead-lettered to 'failed'.
+    autojudge_max_restart_retries: int = 2
+
     autojudge_dashboard_basic_auth_user: str | None = None
     autojudge_dashboard_basic_auth_pass: str | None = None
     autojudge_intake_basic_auth_user: str | None = None
