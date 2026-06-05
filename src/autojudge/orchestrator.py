@@ -573,6 +573,7 @@ def _run_pipeline(
                     journeys=inferred.user_journeys,
                     submission_id=submission_id,
                     test_credentials=test_credentials,
+                    archetype=arch_report.archetype,
                 )
             except Exception as exc:
                 _record_failure(store, submission_id, "browser_verifier", exc)
