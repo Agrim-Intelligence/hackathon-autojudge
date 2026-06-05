@@ -24,7 +24,14 @@ def _base_weights() -> dict[RubricDimensionId, int]:
     return {d.id: d.base_weight for d in DIMENSIONS}
 
 
-def profile_for(archetype: Archetype, *, has_live_url: bool) -> WeightProfile:
+def profile_for(archetype: Archetype, *, has_functional_evidence: bool) -> WeightProfile:
+    """Build the weight/cap profile for an archetype.
+
+    ``has_functional_evidence`` is True when *some* verifier observed the app
+    actually working — a web browser_ok OR an api_ok. When absent (no live URL,
+    a CLI/notebook with no machine verifier, an unreachable API) Functional
+    Correctness is capped, uniformly across app types.
+    """
     weights = _base_weights()
     caps: dict[RubricDimensionId, tuple[int, str]] = {}
     notes: list[str] = []
@@ -37,10 +44,10 @@ def profile_for(archetype: Archetype, *, has_live_url: bool) -> WeightProfile:
     elif archetype == Archetype.TOOL:
         notes.append("Tool archetype: base weights retained; UX still matters for CLI/SDK clarity.")
     elif archetype == Archetype.DEMO:
-        if not has_live_url:
+        if not has_functional_evidence:
             caps[RubricDimensionId.FUNCTIONAL] = (
                 6,
-                "Demo-only submission without a reachable live URL — Functional Correctness capped at 6/10.",
+                "Demo-only submission without verified functional evidence — Functional Correctness capped at 6/10.",
             )
         notes.append("Demo archetype: emphasis on Communication + AI sophistication.")
     elif archetype == Archetype.PRODUCT:
@@ -48,12 +55,12 @@ def profile_for(archetype: Archetype, *, has_live_url: bool) -> WeightProfile:
     else:
         notes.append("Unknown archetype: base weights retained, will request human review.")
 
-    if not has_live_url and archetype != Archetype.DEMO:
+    if not has_functional_evidence and archetype != Archetype.DEMO:
         caps.setdefault(
             RubricDimensionId.FUNCTIONAL,
             (
                 6,
-                "No reachable live URL — Functional Correctness capped at 6/10.",
+                "No verified functional evidence (no reachable live URL / API / executed app) — Functional Correctness capped at 6/10.",
             ),
         )
 
