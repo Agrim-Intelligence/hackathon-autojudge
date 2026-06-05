@@ -45,3 +45,8 @@ Thumbs.db
 # Plans + transcripts live outside the workspace too, but belt-and-braces
 plans/
 *.log
+
+# Local working artifacts (per-repo truth / session state — not shared)
+.claude/project-rules.md
+.claude/scheduled_tasks.lock
+test_report.md

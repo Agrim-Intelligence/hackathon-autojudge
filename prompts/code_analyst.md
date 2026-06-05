@@ -20,4 +20,5 @@ Output a single JSON object:
 Rules:
 - Cite real file paths, line counts, dependencies, commit ratios.
 - Do not speculate beyond evidence. If something is unknown, say so.
+- `code_size_bytes_estimate` is a BYTE total (GitHub language bytes), NOT lines of code. A large size with few commits is NOT evidence of a "bulk import" — do not infer cheating from size or commit count. Commit-window signals are already provided deterministically; do not restate them as `integrity_flags`.
 - The `summary_for_scorer` is the only field the rubric scorer reads — make it self-contained.
