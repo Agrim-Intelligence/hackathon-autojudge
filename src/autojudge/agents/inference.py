@@ -64,6 +64,52 @@ def run_inference(bundle: ArtifactBundle) -> tuple[InferredSubmission, list[LLMR
     return _run_single_shot(bundle)
 
 
+def infer_app_type(
+    bundle: ArtifactBundle,
+    inferred: InferredSubmission,
+    *,
+    api_base_url: str | None = None,
+    api_endpoints: list | None = None,
+    notebook_path: str | None = None,
+    cli_command: str | None = None,
+    has_html_live_page: bool | None = None,
+) -> str:
+    """Cheap best-guess app_type when the candidate did not declare one.
+
+    Heuristic only — no extra LLM call. Reuses tech-stack signals the inference
+    agent already extracted plus the declared P1 artifact fields. Returns one of
+    the AppType enum string values; defaults to "web" since a reachable HTTP URL
+    is the dominant case at this hackathon.
+    """
+    if api_base_url or api_endpoints:
+        return "api"
+    if notebook_path or _mentions(bundle, inferred, ".ipynb", "jupyter", "notebook"):
+        return "notebook"
+
+    tech = inferred.tech_stack.value or {}
+    tech_blob = " ".join(f"{k} {v}" for k, v in tech.items()).lower()
+    if any(s in tech_blob for s in ("fastapi", "flask api", "express", "rest api", "graphql", "grpc")):
+        # API frameworks are also used to serve web UIs; only call it api when
+        # there is no rendered live page to verify as web.
+        if has_html_live_page is False or (not bundle.live_url):
+            return "api"
+
+    if cli_command or _mentions(bundle, inferred, "cli", "command-line", "command line"):
+        if not bundle.live_url:
+            return "cli"
+
+    if bundle.live_url:
+        return "web"
+    if any(s in tech_blob for s in ("pytorch", "tensorflow", "scikit", "model weights", "ml model")):
+        return "ml_model"
+    return "other"
+
+
+def _mentions(bundle: ArtifactBundle, inferred: InferredSubmission, *needles: str) -> bool:
+    hay = (bundle.free_text or "").lower() + " " + (inferred.summary_for_scorer or "").lower()
+    return any(n.lower() in hay for n in needles)
+
+
 # ---------------------------------------------------------------------------
 # Tool-calling loop (Anthropic)
 # ---------------------------------------------------------------------------

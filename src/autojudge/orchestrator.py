@@ -29,6 +29,7 @@ from typing import Any
 
 from .agents import (
     ai_sophistication,
+    api_prober,
     archetype as archetype_agent,
     browser_verifier,
     code_analyst,
@@ -36,6 +37,7 @@ from .agents import (
     inference as inference_agent,
     rubric_scorer,
 )
+from .agents.api_prober import ApiProberReport
 from .agents.inference_tools import ArtifactBundle
 from .config import get_settings
 from .intake.deck import parse_deck
@@ -107,6 +109,7 @@ from .models import (
     CodeAnalystReport,
     CrossCheckReport,
     GuardReport,
+    InferredJourney,
     InferredSubmission,
     RubricScore,
     Submission,
@@ -191,6 +194,36 @@ def _record_failure(store, submission_id: str, step: str, exc: BaseException) ->
             error=tb[:8000],
         )
     )
+
+
+def _declared_to_inferred(declared: list) -> list[InferredJourney]:
+    """Convert candidate-DECLARED journeys into the verifier's journey shape.
+
+    Declared journeys (``DeclaredJourney``: name/steps/expected_outcome) carry
+    no provenance of their own — they are, by definition, candidate-stated, so
+    we tag ``source="stated"``. Accepts dicts (extras_json) or objects.
+    """
+    out: list[InferredJourney] = []
+    for j in declared or []:
+        name = j.get("name") if isinstance(j, dict) else getattr(j, "name", None)
+        steps = j.get("steps") if isinstance(j, dict) else getattr(j, "steps", None)
+        outcome = (
+            j.get("expected_outcome") if isinstance(j, dict) else getattr(j, "expected_outcome", None)
+        )
+        steps = [str(s) for s in (steps or []) if s]
+        if not steps:
+            continue
+        out.append(
+            InferredJourney(
+                name=str(name or f"Journey {len(out) + 1}"),
+                steps=steps,
+                expected_outcome=str(outcome or ""),
+                source="stated",
+                provenance="candidate-declared journey",
+                confidence=1.0,
+            )
+        )
+    return out
 
 
 def run_submission(submission_id: str) -> None:
@@ -369,6 +402,16 @@ def _run_pipeline(
             )
     has_live_url = bool(deploy and deploy.reachable)
 
+    # --- App-type + declared artifacts (P1) ---
+    # app_type drives which functional verifier runs (browser vs api vs none).
+    # Default to "web" when unset/empty — the historical assumption. The new
+    # artifact fields are serialized in extras_json by the intake layer.
+    extras = json.loads(sub_row.get("extras_json") or "{}")
+    app_type = (sub_row.get("app_type") or extras.get("app_type") or "web").strip().lower() or "web"
+    api_base_url = extras.get("api_base_url")
+    api_endpoints = extras.get("api_endpoints") or []
+    declared_journeys = extras.get("declared_journeys") or []
+
     # --- Repo snapshot (one tarball per submission; all agents share it) ---
     repo_url = sub_row.get("repo_url")
     if repo_url:
@@ -536,66 +579,192 @@ def _run_pipeline(
         budget_flags.extend(_check_budget("ai_sophistication", [ai_resp] if ai_resp else []))
         _pace()
 
-    # --- Browser verifier (resumable) ---
-    # This is the most common cause of a hung submission. If we've already
-    # blown the deadline, skip the agent and synthesise a stub report so the
-    # scorer still has something to consume; otherwise run normally and
-    # convert a mid-run timeout into the same stub. On a requeued re-run a
-    # prior successful report is rebuilt from the trace store, which is exactly
-    # what makes resume worthwhile (browser is the slowest agent).
-    if "browser_verifier" in resume:
-        browser_report = _rebuild_from_cache(
-            BrowserVerifierReport, resume["browser_verifier"]
+    # --- App-type fallback (P1) ---
+    # When the candidate did not declare an app_type (unset/"other"), infer a
+    # cheap best guess from the artifacts the inference agent already saw and
+    # persist it so the dashboard + a resumed run agree. Never overrides an
+    # explicit candidate declaration.
+    if app_type in ("", "other"):
+        guessed = inference_agent.infer_app_type(
+            ArtifactBundle(
+                repo_url=sub_row.get("repo_url"),
+                live_url=sub_row.get("live_url"),
+                video_url=sub_row.get("video_url"),
+                deck_path=sub_row.get("deck_path"),
+                free_text=guard_report.sanitized_text,
+            ),
+            inferred,
+            api_base_url=api_base_url,
+            api_endpoints=api_endpoints,
+            notebook_path=extras.get("notebook_path"),
+            cli_command=extras.get("cli_command"),
+            has_html_live_page=("html" in ((deploy.content_type or "").lower())) if deploy else None,
         )
-        logger.info("[%s] resume: browser_verifier from checkpoint", submission_id)
-    else:
-        browser_skip_reason: str | None = None
-        try:
-            check_deadline("pre_browser_verifier")
-        except _DeadlineExceeded as exc:
-            browser_skip_reason = str(exc)
+        if guessed != app_type:
+            app_type = guessed
+            set_app_type = getattr(store, "set_app_type", None)
+            if callable(set_app_type):
+                try:
+                    set_app_type(submission_id, app_type)
+                except Exception as exc:  # pragma: no cover - persistence is best-effort
+                    logger.warning("[%s] set_app_type failed: %s", submission_id, exc)
+            logger.info("[%s] app_type inferred as %s", submission_id, app_type)
 
-        t0 = _now()
-        browser_calls: list[LLMResponse] = []
-        if browser_skip_reason is not None:
-            browser_report = BrowserVerifierReport(
-                live_url_reachable=has_live_url,
-                skipped=True,
-                skipped_reason=browser_skip_reason,
-                summary="Browser verifier skipped: submission_timeout reached.",
-                summary_for_scorer="Browser verifier skipped due to submission_timeout.",
-            )
-            budget_flags.append(f"submission_timeout: {browser_skip_reason}")
+    # --- Functional verifier dispatch (P1, app_type-aware) ---
+    # web  -> browser_verifier (the historical path)
+    # api  -> api_prober (deterministic HTTP against declared endpoints)
+    # else -> no machine verifier; synthesise a legible "not machine-verifiable"
+    #         stub so the scorer routes functional/UX to judge review.
+    # Every branch yields a BrowserVerifierReport-shaped ``browser_report`` so
+    # the scorer's existing browser handling keeps working; the api branch also
+    # threads an ``api_report`` through. ``functional_evidence`` feeds the
+    # weight profile (browser_ok OR api_ok).
+    api_report: ApiProberReport | None = None
+
+    if app_type == "api":
+        # --- API prober (resumable) ---
+        if "api_prober" in resume:
+            api_report = _rebuild_from_cache(ApiProberReport, resume["api_prober"])
+            logger.info("[%s] resume: api_prober from checkpoint", submission_id)
         else:
             try:
-                browser_report, browser_calls = browser_verifier.verify(
-                    live_url=live_url,
-                    journeys=inferred.user_journeys,
-                    submission_id=submission_id,
-                    test_credentials=test_credentials,
-                    archetype=arch_report.archetype,
+                check_deadline("pre_api_prober")
+            except _DeadlineExceeded as exc:
+                api_report = ApiProberReport(
+                    skipped=True,
+                    skipped_reason=str(exc),
+                    summary="API prober skipped: submission_timeout reached.",
+                    summary_for_scorer="API prober skipped due to submission_timeout.",
                 )
-            except Exception as exc:
-                _record_failure(store, submission_id, "browser_verifier", exc)
-                raise
-        t1 = _now()
-        last_browser_call = browser_calls[-1] if browser_calls else None
-        total_browser_cost = sum(c.estimated_cost_usd for c in browser_calls)
-        out_dict = browser_report.model_dump(mode="json")
-        out_dict["llm_call_count"] = len(browser_calls)
-        out_dict["llm_total_cost_usd"] = round(total_browser_cost, 4)
+                budget_flags.append(f"submission_timeout: {exc}")
+            if api_report is None:
+                t0 = _now()
+                try:
+                    api_report, _api_calls = api_prober.verify_api(
+                        base_url=api_base_url or live_url,
+                        endpoints=api_endpoints,
+                        submission_id=submission_id,
+                        test_credentials=test_credentials,
+                    )
+                except Exception as exc:
+                    _record_failure(store, submission_id, "api_prober", exc)
+                    raise
+                t1 = _now()
+                _record(
+                    store,
+                    submission_id,
+                    "api_prober",
+                    t0,
+                    t1,
+                    f"base_url={api_base_url or live_url}; endpoints={len(api_endpoints)}",
+                    api_report,
+                )
+                _pace()
+        # Functional-only verifier: no UX surface. Build a browser stand-in that
+        # is skipped (so UX stays insufficient -> judge review) but carries the
+        # api reachability for legibility.
+        browser_report = BrowserVerifierReport(
+            live_url_reachable=api_report.base_url_reachable,
+            skipped=True,
+            skipped_reason="app_type=api — no browser-renderable UI; functional checked by api_prober.",
+            summary=api_report.summary,
+            summary_for_scorer=api_report.summary_for_scorer,
+        )
+
+    elif app_type == "web":
+        # --- Browser verifier (resumable) ---
+        # Most common cause of a hung submission. If we've already blown the
+        # deadline, skip and synthesise a stub; otherwise run and convert a
+        # mid-run timeout into the same stub. On a requeued re-run a prior
+        # successful report is rebuilt from the trace store (browser is slowest).
+        if "browser_verifier" in resume:
+            browser_report = _rebuild_from_cache(
+                BrowserVerifierReport, resume["browser_verifier"]
+            )
+            logger.info("[%s] resume: browser_verifier from checkpoint", submission_id)
+        else:
+            browser_skip_reason: str | None = None
+            try:
+                check_deadline("pre_browser_verifier")
+            except _DeadlineExceeded as exc:
+                browser_skip_reason = str(exc)
+
+            t0 = _now()
+            browser_calls: list[LLMResponse] = []
+            if browser_skip_reason is not None:
+                browser_report = BrowserVerifierReport(
+                    live_url_reachable=has_live_url,
+                    skipped=True,
+                    skipped_reason=browser_skip_reason,
+                    summary="Browser verifier skipped: submission_timeout reached.",
+                    summary_for_scorer="Browser verifier skipped due to submission_timeout.",
+                )
+                budget_flags.append(f"submission_timeout: {browser_skip_reason}")
+            else:
+                # Declared journeys take precedence over inferred ones: a
+                # candidate-stated journey is the contract they asked to be
+                # judged on. Fall back to inferred journeys when none declared.
+                journeys = _declared_to_inferred(declared_journeys) or inferred.user_journeys
+                try:
+                    browser_report, browser_calls = browser_verifier.verify(
+                        live_url=live_url,
+                        journeys=journeys,
+                        submission_id=submission_id,
+                        test_credentials=test_credentials,
+                        archetype=arch_report.archetype,
+                    )
+                except Exception as exc:
+                    _record_failure(store, submission_id, "browser_verifier", exc)
+                    raise
+            t1 = _now()
+            last_browser_call = browser_calls[-1] if browser_calls else None
+            total_browser_cost = sum(c.estimated_cost_usd for c in browser_calls)
+            out_dict = browser_report.model_dump(mode="json")
+            out_dict["llm_call_count"] = len(browser_calls)
+            out_dict["llm_total_cost_usd"] = round(total_browser_cost, 4)
+            _record(
+                store,
+                submission_id,
+                "browser_verifier",
+                t0,
+                t1,
+                f"live_url={live_url}",
+                out_dict,
+                last_browser_call,
+            )
+            budget_flags.extend(_check_budget("browser_verifier", browser_calls))
+            _pace()
+
+    else:
+        # cli | notebook | ml_model | mobile | hardware | other — no functional
+        # verifier exists without executing candidate code. Make the gap legible
+        # rather than silently penalising; the scorer routes functional/UX to
+        # judge review off the skipped report.
+        reason = (
+            f"app_type={app_type} not machine-verifiable without execution — "
+            "routed to judge review"
+        )
+        browser_report = BrowserVerifierReport(
+            live_url_reachable=has_live_url,
+            skipped=True,
+            skipped_reason=reason,
+            summary=reason,
+            summary_for_scorer=reason,
+        )
         _record(
             store,
             submission_id,
             "browser_verifier",
-            t0,
-            t1,
-            f"live_url={live_url}",
-            out_dict,
-            last_browser_call,
+            _now(),
+            _now(),
+            f"app_type={app_type} (no machine verifier)",
+            browser_report.model_dump(mode="json"),
         )
-        budget_flags.extend(_check_budget("browser_verifier", browser_calls))
-        _pace()
+        budget_flags.append(f"not_machine_verifiable: {reason}")
+
+    functional_evidence = has_live_url or bool(
+        api_report and not api_report.skipped and api_report.api_ok
+    )
 
     check_deadline("pre_cross_check")
     # --- Cross-check (resumable) ---
@@ -617,7 +786,7 @@ def _run_pipeline(
         _pace()
 
     # --- Weights & caps ---
-    weights = profile_for(arch_report.archetype, has_live_url=has_live_url)
+    weights = profile_for(arch_report.archetype, has_functional_evidence=functional_evidence)
 
     # --- Rubric scorer ---
     t0 = _now()
@@ -632,6 +801,7 @@ def _run_pipeline(
             cross=cross_report,
             guard=guard_report,
             weights=weights,
+            api=api_report,
         )
     except Exception as exc:
         _record_failure(store, submission_id, "rubric_scorer", exc)

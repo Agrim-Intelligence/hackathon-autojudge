@@ -34,6 +34,7 @@ from ..models import (
 )
 from ..rubric.dimensions import DIMENSIONS_BY_ID, render_rubric_for_prompt
 from ..rubric.weights import WeightProfile
+from .api_prober import ApiProberReport
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +96,7 @@ def _max_evidence_kind(
     ai_soph: AISophisticationReport,
     browser: BrowserVerifierReport,
     cross: CrossCheckReport,
+    api: ApiProberReport | None = None,
 ) -> EvidenceKind:
     """Strongest evidence_kind the pipeline can defensibly attest to.
 
@@ -103,13 +105,17 @@ def _max_evidence_kind(
     and computed from pipeline state, never LLM-judged.
     """
     browser_ok = _has_browser_success(browser)
+    api_ok = bool(api and not api.skipped and api.api_ok)
+    # An API submission can reach `verified` functional via the prober even
+    # though it has no browser-renderable UI. UX stays browser-only.
+    functional_evidence = browser_ok or api_ok
     has_repo = code.metrics is not None
     candidate_words = _candidate_provided_body(inferred)
     cross_has_signal = bool(cross.summary_for_scorer or cross.summary or cross.discrepancies)
     ai_probe_ran = bool(ai_soph.summary_for_scorer or ai_soph.evidence)
 
     if dim_id == RubricDimensionId.FUNCTIONAL:
-        if browser_ok:
+        if functional_evidence:
             return "verified"
         if has_repo or cross_has_signal:
             return "inferred"
@@ -290,6 +296,7 @@ def score(
     cross: CrossCheckReport,
     guard: GuardReport,
     weights: WeightProfile,
+    api: ApiProberReport | None = None,
 ) -> tuple[RubricScore, LLMResponse | None]:
     llm = get_llm()
 
@@ -311,6 +318,15 @@ def score(
 
     discrepancies_block = json.dumps(cross.discrepancies, indent=2, default=str)[:1500]
 
+    if api is not None:
+        api_block = (
+            f"{api.summary_for_scorer or api.summary or '(no summary)'}\n"
+            f"api_ok: {api.api_ok}; base_url_reachable: {api.base_url_reachable}; "
+            f"skipped: {api.skipped} ({api.skipped_reason or ''})"
+        )
+    else:
+        api_block = "(not an API submission)"
+
     user = (
         f"### Archetype\n{archetype.value} (weight notes: {weights.notes})\n\n"
         f"### Weights per dimension\n{weights_block}\n\n"
@@ -323,6 +339,7 @@ def score(
         f"### Browser verifier summary\n{browser.summary_for_scorer or browser.summary or '(no summary)'}\n"
         f"Reachable: {browser.live_url_reachable}; skipped: {browser.skipped} "
         f"({browser.skipped_reason or ''})\n\n"
+        f"### API prober summary\n{api_block}\n\n"
         f"### Cross-check summary\n{cross.summary_for_scorer or cross.summary or '(no summary)'}\n"
         f"Discrepancies: {discrepancies_block}\n\n"
         f"### Guard report\nseverity={guard.severity}; "
@@ -414,6 +431,7 @@ def score(
             ai_soph=ai_soph,
             browser=browser,
             cross=cross,
+            api=api,
         )
         ekind = _clamp_kind(llm_kind, ceiling)
         if ekind != llm_kind:
@@ -476,6 +494,15 @@ def score(
             "insufficient_cause: live app is credential-walled — functional/UX could "
             "not be verified end-to-end. Provide working test credentials and re-run. "
             "This is a missing-evidence gap, not a quality penalty."
+        )
+
+    # API submissions have no UX surface to verify; a skipped/unreachable prober
+    # leaves functional unverified too. Make that legible rather than penalising.
+    if verdict == "insufficient" and api is not None and (api.skipped or not api.api_ok):
+        integrity_flags.append(
+            "insufficient_cause: API submission could not be machine-verified end-to-end "
+            f"({api.skipped_reason or api.summary_for_scorer or 'no declared endpoint responded as expected'}). "
+            "This is a missing-evidence gap, not a quality penalty — routed to judge review."
         )
 
     rubric = RubricScore(

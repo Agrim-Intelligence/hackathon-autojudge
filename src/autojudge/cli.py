@@ -283,14 +283,27 @@ def inspect(submission_id: str) -> None:
 def export_top(
     n: int = typer.Option(10, "--n"),
     out: Path = typer.Option(Path("data/top10.json"), "--out"),
+    app_type: list[str] = typer.Option(
+        None, "--app-type", help="Filter to these AppType values (repeatable)."
+    ),
+    finalist_only: bool = typer.Option(
+        False, "--finalist-only", help="Only include rows the judges marked finalist/winner."
+    ),
 ) -> None:
     """Export the top-N shortlisted submissions to JSON for human judges.
 
-    Each row includes the auto-score, verdict, judge_review_items, and any
-    human override (verdict, notes, auditor, timestamp) so the deliberation
-    meeting has the full evidence pack and audit trail for each candidate.
+    Each row includes the auto-score, verdict, app_type, shortlist_state,
+    judge_review_items, and any human override (verdict, notes, auditor,
+    timestamp) so the deliberation meeting has the full evidence pack and
+    audit trail for each candidate. ``--app-type`` / ``--finalist-only``
+    pass straight through to the store leaderboard filter.
     """
-    rows = get_store().leaderboard()
+    lb_kwargs: dict = {}
+    if app_type:
+        lb_kwargs["app_types"] = list(app_type)
+    if finalist_only:
+        lb_kwargs["finalist_only"] = True
+    rows = get_store().leaderboard(**lb_kwargs)
     top = rows[:n]
     for row in top:
         if row.get("judge_review_items_json"):
@@ -300,6 +313,8 @@ def export_top(
                 row["judge_review_items"] = []
         else:
             row["judge_review_items"] = []
+        row["app_type"] = row.get("app_type")
+        row["shortlist_state"] = row.get("shortlist_state")
         row["override"] = {
             "verdict_override": row.get("verdict_override"),
             "judge_notes": row.get("judge_notes"),

@@ -36,6 +36,17 @@ class Archetype(str, Enum):
     UNKNOWN = "unknown"
 
 
+class AppType(str, Enum):
+    WEB = "web"
+    API = "api"
+    CLI = "cli"
+    NOTEBOOK = "notebook"
+    ML_MODEL = "ml_model"
+    MOBILE = "mobile"
+    HARDWARE = "hardware"
+    OTHER = "other"
+
+
 class RubricDimensionId(str, Enum):
     PROBLEM = "problem_clarity"
     DEPTH = "solution_depth"
@@ -62,6 +73,20 @@ class CandidateInfo(BaseModel):
     team: str | None = None
 
 
+class ApiEndpoint(BaseModel):
+    method: str = "GET"            # GET/HEAD/POST — destructive verbs rejected by the prober
+    path: str                      # e.g. "/api/health" (joined to api_base_url or live_url)
+    expected_status: int | None = None
+    sample_body: str | None = None # only used for declared POST endpoints
+    description: str | None = None
+
+
+class DeclaredJourney(BaseModel):
+    name: str
+    steps: list[str] = Field(default_factory=list)
+    expected_outcome: str = ""
+
+
 class SubmissionArtifacts(BaseModel):
     submission_md_path: str
     repo_url: str | None = None
@@ -69,6 +94,11 @@ class SubmissionArtifacts(BaseModel):
     video_url: str | None = None
     deck_path: str | None = None
     test_credentials: str | None = None
+    api_base_url: str | None = None
+    api_endpoints: list[ApiEndpoint] = Field(default_factory=list)
+    cli_command: str | None = None
+    notebook_path: str | None = None
+    declared_journeys: list[DeclaredJourney] = Field(default_factory=list)
 
 
 class Submission(BaseModel):
@@ -78,6 +108,7 @@ class Submission(BaseModel):
     submission_md_raw: str
     submission_md_sanitized: str | None = None
     archetype: Archetype = Archetype.UNKNOWN
+    app_type: AppType = AppType.OTHER
     status: SubmissionStatus = SubmissionStatus.PENDING
     created_at: datetime = Field(default_factory=utcnow)
     is_anchor: bool = False
