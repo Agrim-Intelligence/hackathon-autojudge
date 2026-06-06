@@ -705,6 +705,14 @@ def render_submission(submission_id: str) -> None:
         help=f"{cost_label} — {cost_info['run_count']} verifier runs",
     )
 
+    # Surface whether test credentials were provided so judges can distinguish
+    # "credential-walled with no creds" from "credential-walled with creds that failed".
+    _extras = json.loads(sub.get("extras_json") or "{}")
+    _has_creds = bool((_extras.get("test_credentials") or "").strip())
+    st.caption(
+        ":green[✓ test credentials provided]" if _has_creds else ":gray[○ no test credentials]"
+    )
+
     if total and total.get("normalized"):
         st.warning(
             "Score is normalised over evaluable dimensions only. "

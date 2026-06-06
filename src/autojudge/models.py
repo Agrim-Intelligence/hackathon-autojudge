@@ -69,7 +69,7 @@ EvidenceKind = Literal["stated", "inferred", "verified", "insufficient"]
 
 class CandidateInfo(BaseModel):
     name: str
-    email: str | None = None
+    email: str | None = None  # outreach only — not consumed by any pipeline agent or surfaced on the judge dashboard
     team: str | None = None
 
 

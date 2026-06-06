@@ -22,25 +22,29 @@ from __future__ import annotations
 # SQLite dialect
 # -----------------------------------------------------------------------------
 
-SCHEMA_SQLITE = """
-CREATE TABLE IF NOT EXISTS submissions (
-    id TEXT PRIMARY KEY,
-    candidate_name TEXT NOT NULL,
-    candidate_email TEXT,
-    team TEXT,
-    repo_url TEXT,
-    live_url TEXT,
-    video_url TEXT,
-    deck_path TEXT,
-    archetype TEXT DEFAULT 'unknown',
-    app_type TEXT DEFAULT 'other',
-    status TEXT DEFAULT 'pending',
-    is_anchor INTEGER DEFAULT 0,
-    created_at TEXT NOT NULL,
-    extras_json TEXT,
-    submission_md_raw TEXT
-);
+_SUBMISSIONS_DDL_SQLITE = (
+    "CREATE TABLE IF NOT EXISTS submissions (\n"
+    "    id TEXT PRIMARY KEY,\n"
+    "    candidate_name TEXT NOT NULL,\n"
+    # outreach metadata — collected for post-event communication; not used in scoring pipeline
+    "    candidate_email TEXT,\n"
+    "    team TEXT,\n"
+    "    repo_url TEXT,\n"
+    "    live_url TEXT,\n"
+    "    video_url TEXT,\n"
+    # transient local-FS path written by the intake service; canonical blob is in submission_blobs
+    "    deck_path TEXT,\n"
+    "    archetype TEXT DEFAULT 'unknown',\n"
+    "    app_type TEXT DEFAULT 'other',\n"
+    "    status TEXT DEFAULT 'pending',\n"
+    "    is_anchor INTEGER DEFAULT 0,\n"
+    "    created_at TEXT NOT NULL,\n"
+    "    extras_json TEXT,\n"
+    "    submission_md_raw TEXT\n"
+    ");\n"
+)
 
+SCHEMA_SQLITE = _SUBMISSIONS_DDL_SQLITE + """
 CREATE INDEX IF NOT EXISTS idx_submissions_status ON submissions(status);
 
 CREATE TABLE IF NOT EXISTS submission_blobs (
@@ -183,25 +187,29 @@ CREATE INDEX IF NOT EXISTS idx_scores_dimension ON scores(dimension);
 #   the table will be created in place.
 # -----------------------------------------------------------------------------
 
-SCHEMA_POSTGRES = """
-CREATE TABLE IF NOT EXISTS submissions (
-    id TEXT PRIMARY KEY,
-    candidate_name TEXT NOT NULL,
-    candidate_email TEXT,
-    team TEXT,
-    repo_url TEXT,
-    live_url TEXT,
-    video_url TEXT,
-    deck_path TEXT,
-    archetype TEXT DEFAULT 'unknown',
-    app_type TEXT DEFAULT 'other',
-    status TEXT DEFAULT 'pending',
-    is_anchor INTEGER DEFAULT 0,
-    created_at TEXT NOT NULL,
-    extras_json TEXT,
-    submission_md_raw TEXT
-);
+_SUBMISSIONS_DDL_POSTGRES = (
+    "CREATE TABLE IF NOT EXISTS submissions (\n"
+    "    id TEXT PRIMARY KEY,\n"
+    "    candidate_name TEXT NOT NULL,\n"
+    # outreach metadata — collected for post-event communication; not used in scoring pipeline
+    "    candidate_email TEXT,\n"
+    "    team TEXT,\n"
+    "    repo_url TEXT,\n"
+    "    live_url TEXT,\n"
+    "    video_url TEXT,\n"
+    # transient local-FS path written by the intake service; canonical blob is in submission_blobs
+    "    deck_path TEXT,\n"
+    "    archetype TEXT DEFAULT 'unknown',\n"
+    "    app_type TEXT DEFAULT 'other',\n"
+    "    status TEXT DEFAULT 'pending',\n"
+    "    is_anchor INTEGER DEFAULT 0,\n"
+    "    created_at TEXT NOT NULL,\n"
+    "    extras_json TEXT,\n"
+    "    submission_md_raw TEXT\n"
+    ");\n"
+)
 
+SCHEMA_POSTGRES = _SUBMISSIONS_DDL_POSTGRES + """
 CREATE INDEX IF NOT EXISTS idx_submissions_status ON submissions(status);
 
 CREATE TABLE IF NOT EXISTS submission_blobs (
