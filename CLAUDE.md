@@ -40,6 +40,21 @@ shortlist. Python pipeline + two Streamlit services (dashboard, intake) + Postgr
   `finalized_by/at`) from its `ON CONFLICT DO UPDATE`. Re-scoring must never erase a judge's
   override or finalist pick.
 
+### Intake field contract
+- **Email is outreach metadata**, not a pipeline signal. It is intentionally collected for
+  post-event communication. Never feed it to a reasoning agent or surface it on the judge
+  dashboard. Its presence in the schema is deliberate — do not "clean it up" as dead.
+- **CLI command / Notebook path are app-type classification hints**, not execution inputs. No
+  verifier runs candidate code from these fields. UI labels must say so.
+- **All candidate-authored text is sanitised before any reasoning LLM sees it** — submission
+  body, README, deck, transcript, live-page text, **and declared journey steps + expected
+  outcomes**. Declared journeys go through `guard.sanitize()` twice: at intake (before store)
+  and at `browser_verifier` prompt construction for `source="stated"` journeys. Adding a new
+  candidate-controlled text channel means adding a `sanitize()` call.
+- **`submissions.deck_path`** is a transient local-FS reference written by the intake service.
+  The canonical artifact is the blob in `submission_blobs`; the orchestrator re-materialises from
+  it. Never rely on `deck_path` for a cross-service read.
+
 ## Calibration & CI
 - Anchors (`rubric/anchors.py`) are markdown fixtures; their scores drift with model behaviour.
   When `anchor-smoke` fails on drift beyond `MAX_DRIFT`, **recalibrate `expected_total` to the
