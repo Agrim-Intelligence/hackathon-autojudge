@@ -335,6 +335,7 @@ def render_leaderboard() -> None:
             f"{d.name[:3]} {dims[d.id.value]:.0f}" if d.id.value in dims and dims[d.id.value] is not None else f"{d.name[:3]} —"
             for d in DIMENSIONS
         )
+        ew = r.get("evaluable_weight") or 100
         table_rows.append(
             {
                 "#": r.get("shortlist_rank") or idx,
@@ -343,6 +344,7 @@ def render_leaderboard() -> None:
                 "team": r.get("team") or "solo",
                 "type": r.get("app_type") or "—",
                 "score": r.get("total_score"),
+                "ew": ew,
                 "verdict": eff,
                 "dims": dim_str,
                 "shortlist": r.get("shortlist_state") or "none",
@@ -363,7 +365,14 @@ def render_leaderboard() -> None:
         column_config={
             "id": None,
             "#": st.column_config.NumberColumn(width="small"),
-            "score": st.column_config.NumberColumn(format="%.1f", width="small"),
+            "score": st.column_config.NumberColumn(
+                format="%.1f", width="small",
+                help="Normalised total (0–100). If evaluable weight < 100, the score is computed only over dimensions with enough evidence and rescaled.",
+            ),
+            "ew": st.column_config.NumberColumn(
+                "ew/100", width="small",
+                help="Evaluable weight — the share of the rubric (out of 100 pts) that had enough evidence to score. Below 50 forces an 'insufficient' verdict regardless of score.",
+            ),
             "live": st.column_config.CheckboxColumn("🔗", width="small"),
             "⚠": st.column_config.TextColumn("⚠", width="small"),
             "reviews": st.column_config.NumberColumn("reviews", width="small"),
@@ -434,21 +443,42 @@ def _render_board_row(r: dict[str, Any], judge_identity: str) -> None:
             badge_parts.append(":orange-background[⚠ INTEGRITY]")
         st.markdown("  ".join(badge_parts))
 
-        # --- key metrics ---
+        # --- key metrics with hover-tooltip breakdown ---
+        dims = r.get("dimensions") or {}
+        ew = r.get("evaluable_weight") or 100
+        normalized = bool(r.get("normalized"))
+
+        # Build the score breakdown tooltip shown on hover (ⓘ icon)
+        dim_lines = []
+        for dim in DIMENSIONS:
+            v = dims.get(dim.id.value) if isinstance(dims, dict) else None
+            dim_lines.append(f"• {dim.name} ({dim.base_weight}pt): {'—' if v is None else f'{v:.1f}/10'}")
+        score_help = "\n".join(dim_lines)
+        if normalized:
+            score_help += f"\n\nOnly {ew}/100 pts had enough evidence → score normalised over those dims."
+        else:
+            score_help += "\n\nAll 6 dimensions scored — no normalisation applied."
+        if r.get("summary"):
+            score_help += f"\n\nScorer: {(r['summary'] or '')[:300]}"
+
+        ew_help = (
+            f"{ew}/100 pts of the rubric had sufficient evidence to score.\n"
+            + ("Below 50 → verdict forced to 'insufficient'." if ew < 50 else "Above 50 → verdict driven by score.")
+        )
+
         meta = st.columns(5)
-        meta[0].metric("Score", score)
-        meta[1].metric("Evaluable", f"{r.get('evaluable_weight', 100)}/100")
+        meta[0].metric("Score", score, help=score_help)
+        meta[1].metric("Evaluable", f"{ew}/100", help=ew_help)
         meta[2].metric("Reviews", len(review_items))
         meta[3].metric("Live", "✓" if r.get("live_url") else "✗")
         meta[4].metric("Status", r.get("status") or "—")
 
         # --- dimension scores as chips ---
-        dims = r.get("dimensions") or {}
         dim_cols = st.columns(6)
         for col, dim in zip(dim_cols, DIMENSIONS):
             v = dims.get(dim.id.value) if isinstance(dims, dict) else None
             val = f"{v:.1f}" if isinstance(v, (int, float)) else "—"
-            col.metric(dim.name[:6], val)
+            col.metric(dim.name[:6], val, help=f"{dim.name} · base weight {dim.base_weight}/100")
 
         if is_quarantine:
             st.error("⛔ Quarantined:\n" + "\n".join(f"- {f}" for f in flags if f.startswith(_QUARANTINE_FLAG_PREFIX)))
