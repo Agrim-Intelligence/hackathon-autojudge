@@ -290,6 +290,20 @@ def _run_journey(
         else settings.autojudge_browser_max_steps
     )
 
+    # Sanitize candidate-declared journey text (source="stated") ONCE before the
+    # step loop — the steps/outcome are loop-invariant, so guarding them per step
+    # would fire up to 2*max_steps redundant guard-LLM calls. Inferred journeys are
+    # system-generated (and derived from already-sanitized artifacts), so skip them.
+    if getattr(journey, "source", "inferred") == "stated":
+        _j_san = sanitize("\n".join(journey.steps), source_label="stated-journey-steps")[0].sanitized_text
+        _journey_steps_txt = "\n".join(f"- {s}" for s in _j_san.splitlines() if s.strip())
+        _journey_outcome_txt = sanitize(
+            journey.expected_outcome or "", source_label="stated-journey-outcome"
+        )[0].sanitized_text
+    else:
+        _journey_steps_txt = "\n".join(f"- {s}" for s in journey.steps)
+        _journey_outcome_txt = journey.expected_outcome or ""
+
     success = False
     final_observation = ""
     failure_reason: str | None = None
@@ -326,10 +340,11 @@ def _run_journey(
         headings_txt = "; ".join(
             h.get("text", "") for h in elements.get("headings", []) if h.get("text")
         )
+
         user = (
             f"### Journey\nName: {journey.name}\nSteps:\n"
-            + "\n".join(f"- {s}" for s in journey.steps)
-            + f"\nExpected outcome: {journey.expected_outcome}\n"
+            + _journey_steps_txt
+            + f"\nExpected outcome: {_journey_outcome_txt}\n"
             + (f"Sample input: {journey.sample_input}\n" if journey.sample_input else "")
             + (f"Test credentials available: {test_credentials}\n" if test_credentials else "")
             + "\n### History of actions so far\n"

@@ -39,6 +39,7 @@ from autojudge.models import (
     SubmissionArtifacts,
     SubmissionStatus,
 )
+from autojudge.sanitize.guard import sanitize as _guard_sanitize
 from autojudge.trace.store import get_store
 
 logger = logging.getLogger(__name__)
@@ -105,14 +106,26 @@ def main() -> None:
     store = get_store()
     submissions_dir = settings.submissions_dir
 
-    st.set_page_config(page_title="Agrim AutoJudge — Intake", layout="wide")
-    st.title("Agrim AutoJudge — Submission Intake")
-    st.caption(
-        "Submit your project. At minimum you need one of: a GitHub repo, a "
-        "live URL, a demo video, or a slide deck. The auto-judge will figure "
-        "out the rest and attribute every score to a specific piece of "
-        "evidence."
+    st.set_page_config(
+        page_title="Agrim AutoJudge — Intake",
+        page_icon="📝",
+        layout="wide",
+        initial_sidebar_state="collapsed",
     )
+    _banner_left, _banner_right = st.columns([3, 1])
+    with _banner_left:
+        st.markdown("## 📝 AutoJudge · Submission Intake")
+        st.caption(
+            "Submit your project. At minimum provide one of: a GitHub repo, "
+            "live URL, demo video, or slide deck."
+        )
+    with _banner_right:
+        try:
+            store.leaderboard(include_anchors=False)
+            st.success("✓ Store connected")
+        except Exception:
+            st.warning("Store unavailable")
+    st.divider()
 
     with st.expander(
         "Want to be more thorough? (optional template you can paste in the body)",
@@ -131,28 +144,35 @@ def main() -> None:
         with col1:
             name = st.text_input("Full name *")
         with col2:
-            email = st.text_input("Email")
+            email = st.text_input(
+                "Email",
+                help="Used for post-event communication. Not shared with judges or surfaced on the scoring dashboard.",
+            )
         with col3:
-            team = st.text_input("Team name (or 'solo')")
+            team = st.text_input("Team name (or 'solo')", placeholder="solo or team name")
 
         st.subheader("Artifacts (provide at least one)")
         repo_url = st.text_input("GitHub repository URL")
         live_url = st.text_input("Live deployed URL")
-        video_url = st.text_input("Demo video URL (YouTube only for v1.0)")
-        test_credentials = st.text_area(
-            "Test credentials / sample inputs (if your app is gated)",
-            height=80,
+        video_url = st.text_input(
+            "Demo video URL (YouTube recommended — transcript will be extracted for scoring)"
         )
-        deck_file = st.file_uploader("Slide deck (PDF, optional)", type=["pdf"])
+        test_credentials = st.text_area(
+            "Test credentials (if your app requires login)",
+            height=80,
+            help="Passed to the browser automation agent to log in. Never stored in logs or shown to judges. Only used during automated testing.",
+        )
+        deck_file = st.file_uploader("Slide deck (PDF)", type=["pdf"])
 
         st.subheader("App type")
         app_type_value = st.selectbox(
             "What kind of app is this?",
             options=[t.value for t in AppType],
             index=list(AppType).index(AppType.WEB),
+            help="Drives which verifier runs. Web = Playwright browser automation; API = HTTP endpoint prober; CLI/Notebook/other = routed to judge review. Web is the default.",
         )
 
-        st.subheader("Type-specific details (optional)")
+        st.subheader("Additional details (optional — improves scoring accuracy)")
         st.caption(
             "Fill in whatever matches your app — the auto-judge uses these to "
             "probe the right surface. Leave the rest blank."
@@ -162,12 +182,18 @@ def main() -> None:
             "API endpoints (one per line: `METHOD /path [expected_status]`)",
             height=100,
         )
-        cli_command = st.text_input("CLI command to run")
-        notebook_path = st.text_input("Notebook path (in repo)")
+        cli_command = st.text_input(
+            "CLI command (app-type hint)",
+            help="Used to classify your submission as a CLI app. The command is NOT executed — it is a classification signal only.",
+        )
+        notebook_path = st.text_input(
+            "Notebook path in repo (app-type hint)",
+            help="E.g. notebooks/demo.ipynb. Used to classify as a notebook app. The notebook is NOT executed.",
+        )
         journeys_raw = st.text_area(
-            "User journeys to test (one per block; first line = name, "
-            "remaining lines = steps; separate journeys with a blank line)",
+            "User journeys to test (optional — overrides auto-detected journeys)",
             height=120,
+            help="Each journey: first line = name, remaining lines = one step per line. Separate journeys with a blank line. These steps are what the browser automation agent will actually run on your live URL.",
         )
 
         st.subheader("Free-form context (optional)")
@@ -176,7 +202,9 @@ def main() -> None:
             "what you built — problem, claims, tech stack, what to test. "
             "Plain prose is fine. The auto-judge will infer structure."
         )
-        submission_md = st.text_area("Notes / SUBMISSION.md content", height=400)
+        submission_md = st.text_area(
+            "Notes / SUBMISSION.md — paste anything helpful (optional)", height=400
+        )
 
         submitted = st.form_submit_button("Submit", type="primary")
 
@@ -200,6 +228,38 @@ def main() -> None:
         for e in errors:
             st.error(e)
         return
+
+    if video_url.strip() and not re.search(
+        r"(youtube\.com/watch|youtu\.be)", video_url, re.IGNORECASE
+    ):
+        st.warning(
+            "⚠️ Transcript extraction supports YouTube links. Other video URLs will be "
+            "referenced but not transcribed for scoring."
+        )
+
+    if journeys_raw.strip():
+        _preview = _parse_journeys(journeys_raw)
+        if _preview:
+            st.caption(
+                "Journeys parsed: "
+                + ", ".join(f'"{j.name}"' for j in _preview[:3])
+                + (f" +{len(_preview)-3} more" if len(_preview) > 3 else "")
+            )
+        else:
+            st.warning(
+                "⚠️ Could not parse any journeys. Check that journeys are separated by a "
+                "blank line and the first line of each block is the journey name."
+            )
+
+    if api_endpoints_raw.strip():
+        _ep_preview = _parse_endpoints(api_endpoints_raw)
+        if _ep_preview:
+            st.caption(
+                "Endpoints parsed: "
+                + ", ".join(f"{e.method} {e.path}" for e in _ep_preview[:5])
+            )
+        else:
+            st.warning("⚠️ No valid endpoints parsed. Use format: GET /api/health 200")
 
     sub_id = _gen_id(name)
     body = submission_md.strip()
@@ -240,6 +300,18 @@ def main() -> None:
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
+    # Sanitize candidate-declared journey text before it reaches the DB and downstream LLMs.
+    # journey steps are candidate-controlled and must go through the same guard as the submission body.
+    # On a TRANSIENT guard outage (severity raised with a "guard_unavailable" marker) the guard
+    # returns a placeholder that would parse to zero journeys — wiping valid candidate input. In
+    # that case keep the raw text; the browser_verifier sanitizes stated journeys again before any
+    # LLM sees them, so the pre-LLM guarantee still holds.
+    _sanitized_journeys_raw = journeys_raw
+    if journeys_raw.strip():
+        _jrep = _guard_sanitize(journeys_raw, source_label="declared-journeys")[0]
+        if "guard_unavailable" not in _jrep.injection_attempts:
+            _sanitized_journeys_raw = _jrep.sanitized_text
+
     submission = Submission(
         id=sub_id,
         candidate=CandidateInfo(**meta["candidate"]),
@@ -254,7 +326,7 @@ def main() -> None:
             api_endpoints=_parse_endpoints(api_endpoints_raw),
             cli_command=cli_command.strip() or None,
             notebook_path=notebook_path.strip() or None,
-            declared_journeys=_parse_journeys(journeys_raw),
+            declared_journeys=_parse_journeys(_sanitized_journeys_raw),
         ),
         app_type=AppType(app_type_value),
         submission_md_raw=body,
@@ -269,13 +341,23 @@ def main() -> None:
             content_type="application/pdf",
         )
 
-    st.success(f"Submission received: `{sub_id}`")
+    st.success(f"✓ Submission received: `{sub_id}`")
+    received_items = []
+    if meta.get("repo_url"):
+        received_items.append("GitHub repo")
+    if meta.get("live_url"):
+        received_items.append("Live URL")
+    if meta.get("video_url"):
+        received_items.append("Demo video")
+    if deck_file is not None:
+        received_items.append("Slide deck")
+    if meta.get("test_credentials"):
+        received_items.append("Test credentials")
     st.info(
-        "Queued. The auto-judge will infer structure from your artifacts and "
-        "internal judges will review the ranked output. Nothing else needed "
-        "from you."
+        "**Received:** " + (", ".join(received_items) if received_items else "context only")
+        + "\n\nThe auto-judge will run shortly. Nothing else needed from you."
     )
-    st.code(json.dumps(meta, indent=2), language="json")
+    st.caption(f"Submission ID: `{sub_id}`")
 
 
 if __name__ == "__main__":
