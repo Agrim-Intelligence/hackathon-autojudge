@@ -579,8 +579,8 @@ class PostgresTraceStore:
 
     def leaderboard(self, include_anchors: bool = False, *,
                     app_types: list[str] | None = None,
-                    verdict: str | None = None,
-                    status: str | None = None,
+                    verdict: list[str] | None = None,
+                    status: list[str] | None = None,
                     has_live_url: bool | None = None,
                     finalist_only: bool = False,
                     search: str | None = None,

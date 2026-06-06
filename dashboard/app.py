@@ -180,7 +180,12 @@ def _judge_identity() -> str:
 # unauthenticated visitor sees first.
 require_basic_auth("dashboard")
 
-st.set_page_config(page_title="Agrim AutoJudge — Review", layout="wide")
+st.set_page_config(
+    page_title="AutoJudge · Judge Review",
+    page_icon="⚖️",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 store = get_store()
 settings = get_settings()
 
@@ -260,52 +265,45 @@ def _provider_panel() -> None:
 
 
 def render_leaderboard() -> None:
-    st.header("Judge board")
-    st.caption(
-        "Filter, scan, and shortlist entirely from here — no drill-down "
-        "required. The Submission detail tab remains for optional audit."
-    )
-    _provider_panel()
+    # --- banner ---
+    banner_left, banner_right = st.columns([3, 2])
+    with banner_left:
+        st.markdown("## ⚖️ AutoJudge · Judge Board")
+        st.caption("Filter, scan, and shortlist — no drill-down required. Expand a row to mark finalist/winner.")
+    with banner_right:
+        _provider_panel()
 
-    # --- filter / sort control bar (pushed straight into leaderboard(...)) ---
-    fc1, fc2, fc3 = st.columns([2, 2, 2])
-    with fc1:
-        sel_app_types = st.multiselect("App type", APP_TYPE_CHOICES, key="board_app_types")
-    with fc2:
-        sel_verdicts = st.multiselect(
-            "Verdict (effective)", VERDICT_EFFECTIVE_CHOICES, key="board_verdicts"
-        )
-    with fc3:
-        sel_status = st.multiselect("Status", STATUS_CHOICES, key="board_status")
+    st.divider()
 
-    fc4, fc5, fc6, fc7 = st.columns([2, 1, 1, 1])
-    with fc4:
-        search = st.text_input(
-            "Search candidate / team", key="board_search", placeholder="name or team…"
-        )
-    with fc5:
-        sort = st.selectbox("Sort by", SORT_CHOICES, index=0, key="board_sort")
-    with fc6:
-        live_only = st.checkbox("Live URL only", value=False, key="board_live_only")
-    with fc7:
-        finalist_only = st.checkbox("Finalists only", value=False, key="board_finalist_only")
+    # --- filter bar (single row, expander keeps it tidy when collapsed) ---
+    with st.expander("🔍  Filters & options", expanded=True):
+        f1, f2, f3, f4 = st.columns([2, 2, 2, 2])
+        with f1:
+            sel_app_types = st.multiselect("App type", APP_TYPE_CHOICES, key="board_app_types")
+        with f2:
+            sel_verdicts = st.multiselect("Verdict", VERDICT_EFFECTIVE_CHOICES, key="board_verdicts")
+        with f3:
+            sel_status = st.multiselect("Status", STATUS_CHOICES, key="board_status")
+        with f4:
+            search = st.text_input("Search", key="board_search", placeholder="name or team…")
 
-    bc1, bc2, bc3, bc4 = st.columns([1, 1, 1, 1])
-    with bc1:
-        include_anchors = st.checkbox("Include calibration anchors", value=False)
-    with bc2:
-        top_n = st.number_input("Top N", min_value=3, max_value=200, value=10, step=1)
-    with bc3:
-        if st.button("Refresh"):
-            _leaderboard_rows.clear()
-            _leaderboard_df.clear()
-            st.rerun()
-    with bc4:
-        auto_refresh = st.checkbox(
-            "Auto-refresh while running",
-            value=False,
-            help="Re-render every 5s when any submission is in the RUNNING state.",
-        )
+        o1, o2, o3, o4, o5, o6 = st.columns([1.5, 1, 1, 1, 1, 1])
+        with o1:
+            sort = st.selectbox("Sort by", SORT_CHOICES, index=0, key="board_sort")
+        with o2:
+            top_n = st.number_input("Top N", min_value=3, max_value=200, value=10, step=1)
+        with o3:
+            live_only = st.checkbox("Live URL only", value=False, key="board_live_only")
+        with o4:
+            finalist_only = st.checkbox("Finalists only", value=False, key="board_finalist_only")
+        with o5:
+            include_anchors = st.checkbox("Anchors", value=False, help="Include calibration anchors")
+        with o6:
+            auto_refresh = st.checkbox("Auto-refresh", value=False, help="Re-render every 5 s while submissions are running.")
+            if st.button("↺ Refresh", use_container_width=True):
+                _leaderboard_rows.clear()
+                _leaderboard_df.clear()
+                st.rerun()
 
     rows = _leaderboard_rows(
         include_anchors,
@@ -332,36 +330,52 @@ def render_leaderboard() -> None:
         eff = r.get("verdict_effective") or r.get("verdict") or "—"
         if r.get("verdict_override"):
             eff = f"{eff}*"
+        dims = r.get("dimensions") or {}
+        dim_str = "  ".join(
+            f"{d.name[:3]} {dims[d.id.value]:.0f}" if d.id.value in dims and dims[d.id.value] is not None else f"{d.name[:3]} —"
+            for d in DIMENSIONS
+        )
         table_rows.append(
             {
-                "rank": r.get("shortlist_rank") or idx,
+                "#": r.get("shortlist_rank") or idx,
                 "id": r.get("id"),
                 "candidate": r.get("candidate_name"),
                 "team": r.get("team") or "solo",
-                "app_type": r.get("app_type") or "—",
+                "type": r.get("app_type") or "—",
                 "score": r.get("total_score"),
                 "verdict": eff,
+                "dims": dim_str,
                 "shortlist": r.get("shortlist_state") or "none",
                 "live": bool(r.get("live_url")),
-                "integrity": "⛔" if is_quarantine else ("⚠" if warn_flags else ""),
-                "review_items": len(_parse_json_list(r.get("judge_review_items_json"))),
+                "⚠": "⛔" if is_quarantine else ("⚠" if warn_flags else ""),
+                "reviews": len(_parse_json_list(r.get("judge_review_items_json"))),
                 "status": r.get("status"),
             }
         )
-    st.dataframe(
-        pd.DataFrame(table_rows),
+    df = pd.DataFrame(table_rows)
+    sel_result = st.dataframe(
+        df,
         use_container_width=True,
         hide_index=True,
+        selection_mode="multi-row",
+        on_select="rerun",
+        key="board_table",
         column_config={
-            "score": st.column_config.NumberColumn(format="%.2f"),
-            "live": st.column_config.CheckboxColumn("live"),
+            "id": None,
+            "#": st.column_config.NumberColumn(width="small"),
+            "score": st.column_config.NumberColumn(format="%.1f", width="small"),
+            "live": st.column_config.CheckboxColumn("🔗", width="small"),
+            "⚠": st.column_config.TextColumn("⚠", width="small"),
+            "reviews": st.column_config.NumberColumn("reviews", width="small"),
+            "dims": st.column_config.TextColumn("dimensions (raw)", width="large"),
         },
     )
+    selected_rows = (sel_result.selection.rows if sel_result and hasattr(sel_result, "selection") else [])
+    selected_ids = [table_rows[i]["id"] for i in selected_rows if i < len(table_rows)]
+
     st.caption(
-        "AutoJudge is a Shortlist Generator — verdicts are recommendations. "
-        "An asterisk (`*`) marks a judge-overridden verdict; ⚠ flags "
-        "quarantine/integrity. Open a row below for dimension chips and to "
-        "mark finalist/winner."
+        "Tick rows to batch-evaluate  ·  ⚠ integrity flags  ·  ⛔ quarantined  ·  "
+        "asterisk (*) = judge override  ·  expand a row below to shortlist"
     )
 
     # --- per-row expander: full evidence + inline shortlist actions ---
@@ -369,7 +383,7 @@ def render_leaderboard() -> None:
     for r in rows:
         _render_board_row(r, judge_identity)
 
-    _evaluate_panel([], all_ids=[r.get("id") for r in rows])
+    _evaluate_panel(selected_ids, all_ids=[r.get("id") for r in rows])
 
     csv = pd.DataFrame(table_rows).head(top_n).to_csv(index=False)
     st.download_button(
@@ -407,32 +421,34 @@ def _render_board_row(r: dict[str, Any], judge_identity: str) -> None:
         + ("  ·  ⛔" if is_quarantine else ("  ·  ⚠" if warn_flags else ""))
     )
     with st.expander(header, expanded=False):
-        chips = [
+        # --- badge row ---
+        badge_parts = [
             f":blue-background[{r.get('app_type') or '—'}]",
-            VERDICT_EFFECTIVE_BADGE.get(eff, eff),
+            VERDICT_EFFECTIVE_BADGE.get(eff.rstrip("*"), eff),
         ]
         if state_tag:
-            chips.append(state_tag)
+            badge_parts.append(state_tag)
         if is_quarantine:
-            chips.append(":red-background[QUARANTINED]")
+            badge_parts.append(":red-background[⛔ QUARANTINED]")
         elif warn_flags:
-            chips.append(":orange-background[INTEGRITY]")
-        st.markdown("  ".join(chips))
+            badge_parts.append(":orange-background[⚠ INTEGRITY]")
+        st.markdown("  ".join(badge_parts))
 
-        meta = st.columns(4)
-        meta[0].metric("Total", score)
-        meta[1].metric("Evaluable wt", f"{r.get('evaluable_weight', 100)}/100")
-        meta[2].metric("Review items", len(review_items))
-        meta[3].metric("Live URL", "yes" if r.get("live_url") else "no")
+        # --- key metrics ---
+        meta = st.columns(5)
+        meta[0].metric("Score", score)
+        meta[1].metric("Evaluable", f"{r.get('evaluable_weight', 100)}/100")
+        meta[2].metric("Reviews", len(review_items))
+        meta[3].metric("Live", "✓" if r.get("live_url") else "✗")
+        meta[4].metric("Status", r.get("status") or "—")
 
-        # Six dimension chips (— for None / insufficient).
+        # --- dimension scores as chips ---
         dims = r.get("dimensions") or {}
-        dim_chips = []
-        for dim in DIMENSIONS:
+        dim_cols = st.columns(6)
+        for col, dim in zip(dim_cols, DIMENSIONS):
             v = dims.get(dim.id.value) if isinstance(dims, dict) else None
-            label = f"{v:.1f}" if isinstance(v, (int, float)) else "—"
-            dim_chips.append(f"**{dim.name}** `{label}`")
-        st.markdown("  ·  ".join(dim_chips))
+            val = f"{v:.1f}" if isinstance(v, (int, float)) else "—"
+            col.metric(dim.name[:6], val)
 
         if is_quarantine:
             st.error("⛔ Quarantined:\n" + "\n".join(f"- {f}" for f in flags if f.startswith(_QUARANTINE_FLAG_PREFIX)))
@@ -991,13 +1007,7 @@ def gaps_panel(
 
 # --- layout ---
 
-st.title("Agrim AutoJudge")
-st.caption(
-    "Internal judging dashboard. Provider routing is .env-driven; "
-    "edit `.env` and restart this app to change provider."
-)
-
-tab_lb, tab_sub = st.tabs(["Leaderboard", "Submission detail"])
+tab_lb, tab_sub = st.tabs(["⚖️  Leaderboard", "🔍  Submission detail"])
 
 with tab_lb:
     render_leaderboard()
