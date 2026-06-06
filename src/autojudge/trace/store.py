@@ -85,8 +85,8 @@ def _leaderboard_filters(
     ph: str,
     include_anchors: bool,
     app_types: list[str] | None,
-    verdict: str | None,
-    status: str | None,
+    verdict: list[str] | None,
+    status: list[str] | None,
     has_live_url: bool | None,
     finalist_only: bool,
     search: str | None,
@@ -101,11 +101,13 @@ def _leaderboard_filters(
         clauses.append(f"s.app_type IN ({marks})")
         params.extend(app_types)
     if verdict:
-        clauses.append(f"COALESCE(t.verdict_override, t.verdict) = {ph}")
-        params.append(verdict)
+        marks = ",".join(ph for _ in verdict)
+        clauses.append(f"COALESCE(t.verdict_override, t.verdict) IN ({marks})")
+        params.extend(verdict)
     if status:
-        clauses.append(f"s.status = {ph}")
-        params.append(status)
+        marks = ",".join(ph for _ in status)
+        clauses.append(f"s.status IN ({marks})")
+        params.extend(status)
     if has_live_url is True:
         clauses.append("s.live_url IS NOT NULL")
     elif has_live_url is False:
@@ -178,8 +180,8 @@ class TraceStoreProtocol(Protocol):
 
     def leaderboard(self, include_anchors: bool = False, *,
                     app_types: list[str] | None = None,
-                    verdict: str | None = None,
-                    status: str | None = None,
+                    verdict: list[str] | None = None,
+                    status: list[str] | None = None,
                     has_live_url: bool | None = None,
                     finalist_only: bool = False,
                     search: str | None = None,
@@ -688,8 +690,8 @@ class TraceStore:
 
     def leaderboard(self, include_anchors: bool = False, *,
                     app_types: list[str] | None = None,
-                    verdict: str | None = None,
-                    status: str | None = None,
+                    verdict: list[str] | None = None,
+                    status: list[str] | None = None,
                     has_live_url: bool | None = None,
                     finalist_only: bool = False,
                     search: str | None = None,
