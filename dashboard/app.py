@@ -213,6 +213,15 @@ def _leaderboard_df(include_anchors: bool) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+@st.cache_data(ttl=30)
+def _dim_scores_for(submission_id: str) -> dict[str, dict]:
+    """Per-dimension score detail (rationale, evidence_kind, cap) for one submission.
+
+    Cached separately from the leaderboard so board rows get full tooltip
+    text without adding 6 columns to every leaderboard row."""
+    return {s["dimension"]: s for s in store.get_scores(submission_id)}
+
+
 @st.cache_data(ttl=10)
 def _leaderboard_rows(
     include_anchors: bool,
@@ -473,12 +482,22 @@ def _render_board_row(r: dict[str, Any], judge_identity: str) -> None:
         meta[3].metric("Live", "✓" if r.get("live_url") else "✗")
         meta[4].metric("Status", r.get("status") or "—")
 
-        # --- dimension scores as chips ---
+        # --- dimension scores with full rationale on hover ---
+        dim_detail = _dim_scores_for(sid)
         dim_cols = st.columns(6)
         for col, dim in zip(dim_cols, DIMENSIONS):
-            v = dims.get(dim.id.value) if isinstance(dims, dict) else None
+            s = dim_detail.get(dim.id.value, {})
+            v = s.get("raw_score") if s else (dims.get(dim.id.value) if isinstance(dims, dict) else None)
             val = f"{v:.1f}" if isinstance(v, (int, float)) else "—"
-            col.metric(dim.name[:6], val, help=f"{dim.name} · base weight {dim.base_weight}/100")
+            ev = s.get("evidence_kind", "—") if s else "—"
+            rationale = (s.get("rationale") or "") if s else ""
+            cap = (s.get("cap_reason") or "") if s else ""
+            tip = f"{dim.name}\nWeight: {dim.base_weight}/100 pts  ·  Evidence: {ev}"
+            if rationale:
+                tip += f"\n\n{rationale[:450]}"
+            if cap:
+                tip += f"\n\nCap applied: {cap}"
+            col.metric(dim.name[:6], val, help=tip)
 
         if is_quarantine:
             st.error("⛔ Quarantined:\n" + "\n".join(f"- {f}" for f in flags if f.startswith(_QUARANTINE_FLAG_PREFIX)))
