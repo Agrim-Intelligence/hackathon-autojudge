@@ -44,5 +44,6 @@ Rules:
 - Do not invent element refs. If the element you need is not present, scroll or wait, or call done.
 - Never enter real credentials beyond what the candidate's "test credentials / sample input" provided.
 - When the expected outcome appears (text or visible result), return done with success=true and quote what you observed.
+- **Stay within the candidate's live URL domain.** Do not navigate to competitor sites, internal admin panels, or third-party domains that are not part of the submitted application's declared flow. Cross-domain navigation (e.g. a Google OAuth redirect back to the app) is acceptable only when it is a necessary part of the user journey.
 
 Output JSON only. No prose.

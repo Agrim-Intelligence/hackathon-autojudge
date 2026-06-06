@@ -326,10 +326,23 @@ def _run_journey(
         headings_txt = "; ".join(
             h.get("text", "") for h in elements.get("headings", []) if h.get("text")
         )
+
+        # Sanitize candidate-declared journey text (source="stated") before it reaches the LLM.
+        # Inferred journeys are system-generated and skip the guard to avoid extra LLM cost.
+        if getattr(journey, "source", "inferred") == "stated":
+            _j_steps = "\n".join(journey.steps)
+            _j_san = sanitize(_j_steps, source_label="stated-journey-steps")[0].sanitized_text
+            _j_outcome = sanitize(journey.expected_outcome or "", source_label="stated-journey-outcome")[0].sanitized_text
+            _journey_steps_txt = "\n".join(f"- {s}" for s in _j_san.splitlines() if s.strip())
+            _journey_outcome_txt = _j_outcome
+        else:
+            _journey_steps_txt = "\n".join(f"- {s}" for s in journey.steps)
+            _journey_outcome_txt = journey.expected_outcome or ""
+
         user = (
             f"### Journey\nName: {journey.name}\nSteps:\n"
-            + "\n".join(f"- {s}" for s in journey.steps)
-            + f"\nExpected outcome: {journey.expected_outcome}\n"
+            + _journey_steps_txt
+            + f"\nExpected outcome: {_journey_outcome_txt}\n"
             + (f"Sample input: {journey.sample_input}\n" if journey.sample_input else "")
             + (f"Test credentials available: {test_credentials}\n" if test_credentials else "")
             + "\n### History of actions so far\n"

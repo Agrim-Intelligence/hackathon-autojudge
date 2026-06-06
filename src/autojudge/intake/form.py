@@ -39,6 +39,7 @@ from autojudge.models import (
     SubmissionArtifacts,
     SubmissionStatus,
 )
+from autojudge.sanitize.guard import sanitize as _guard_sanitize
 from autojudge.trace.store import get_store
 
 logger = logging.getLogger(__name__)
@@ -299,6 +300,10 @@ def main() -> None:
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
+    # Sanitize candidate-declared journey text before it reaches the DB and downstream LLMs.
+    # journey steps are candidate-controlled and must go through the same guard as the submission body.
+    _sanitized_journeys_raw = _guard_sanitize(journeys_raw, source_label="declared-journeys")[0].sanitized_text if journeys_raw.strip() else journeys_raw
+
     submission = Submission(
         id=sub_id,
         candidate=CandidateInfo(**meta["candidate"]),
@@ -313,7 +318,7 @@ def main() -> None:
             api_endpoints=_parse_endpoints(api_endpoints_raw),
             cli_command=cli_command.strip() or None,
             notebook_path=notebook_path.strip() or None,
-            declared_journeys=_parse_journeys(journeys_raw),
+            declared_journeys=_parse_journeys(_sanitized_journeys_raw),
         ),
         app_type=AppType(app_type_value),
         submission_md_raw=body,
