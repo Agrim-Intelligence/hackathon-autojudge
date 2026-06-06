@@ -302,7 +302,15 @@ def main() -> None:
 
     # Sanitize candidate-declared journey text before it reaches the DB and downstream LLMs.
     # journey steps are candidate-controlled and must go through the same guard as the submission body.
-    _sanitized_journeys_raw = _guard_sanitize(journeys_raw, source_label="declared-journeys")[0].sanitized_text if journeys_raw.strip() else journeys_raw
+    # On a TRANSIENT guard outage (severity raised with a "guard_unavailable" marker) the guard
+    # returns a placeholder that would parse to zero journeys — wiping valid candidate input. In
+    # that case keep the raw text; the browser_verifier sanitizes stated journeys again before any
+    # LLM sees them, so the pre-LLM guarantee still holds.
+    _sanitized_journeys_raw = journeys_raw
+    if journeys_raw.strip():
+        _jrep = _guard_sanitize(journeys_raw, source_label="declared-journeys")[0]
+        if "guard_unavailable" not in _jrep.injection_attempts:
+            _sanitized_journeys_raw = _jrep.sanitized_text
 
     submission = Submission(
         id=sub_id,
