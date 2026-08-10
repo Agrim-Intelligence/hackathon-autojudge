@@ -139,13 +139,24 @@ def _run_tool_loop(bundle: ArtifactBundle) -> tuple[InferredSubmission, list[LLM
     nudge_used = False
 
     for _ in range(MAX_TOOL_CALLS):
-        resp = llm.complete_tools(
-            system=system_parts,
-            messages=messages,
-            tools=ANTHROPIC_TOOL_SPECS,
-            tier="reasoning",
-            max_tokens=4096,
-        )
+        try:
+            resp = llm.complete_tools(
+                system=system_parts,
+                messages=messages,
+                tools=ANTHROPIC_TOOL_SPECS,
+                tier="reasoning",
+                max_tokens=4096,
+            )
+        except Exception as exc:
+            # complete_tools() is Anthropic-only and has no cross-provider fallback
+            # of its own (tool-use isn't portable across providers). Rather than
+            # kill the whole submission on an Anthropic-side outage, degrade to the
+            # single-shot path, which already routes through complete_json() and
+            # its existing fallback-provider support.
+            logger.warning("Tool-calling reasoning call failed (%s); falling back to single-shot.", exc)
+            inferred, single_calls = _run_single_shot(bundle)
+            inferred.gaps.insert(0, f"Tool-calling reasoning path failed ({exc}); used single-shot fallback.")
+            return inferred, calls + single_calls
         calls.append(resp)
 
         if not resp.tool_calls:
