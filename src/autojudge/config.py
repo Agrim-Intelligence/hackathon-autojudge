@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     autojudge_gemini_extraction_model: str = "gemini-2.5-flash"
     autojudge_openrouter_reasoning_model: str = "anthropic/claude-sonnet-4.5"
     autojudge_openrouter_extraction_model: str = "openai/gpt-4o-mini"
-    autojudge_anthropic_reasoning_model: str = "claude-sonnet-4-20250514"
+    autojudge_anthropic_reasoning_model: str = "claude-sonnet-5"
     autojudge_anthropic_extraction_model: str = "claude-haiku-4-5-20251001"
 
     autojudge_openrouter_referer: str = "https://agrim.ai"
