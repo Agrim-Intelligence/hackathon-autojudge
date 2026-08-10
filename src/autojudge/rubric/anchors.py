@@ -42,14 +42,21 @@ ANCHORS: list[Anchor] = [
     Anchor(
         id="anchor-strong",
         filename="strong.md",
-        # Recalibrated 2026-06-05 after sustained model-side drift: the original
-        # 65.0 was a single 2026-05-27 Haiku reading, but across CI runs on
-        # unchanged code this markdown-only anchor now centres ~46 (observed
-        # 38.75–50.0, evaluable_weight=20 — only 2 dimensions clear the
-        # provenance clamp without a repo/URL). The swing is LLM nondeterminism,
-        # not a scorer regression. Tighten the anchor with a real repo+URL
+        # Recalibrated 2026-08-10 after the reasoning-tier model swap
+        # (claude-sonnet-4-20250514 -> claude-sonnet-5, retired-model fix):
+        # actual=65.0 vs the prior 46.0 baseline, drift=+19.0. Confirmed
+        # model-side, not a code regression: anchor-mid/-weak (same run, same
+        # code) stayed within MAX_DRIFT (+6.0/-5.7), and the run log shows the
+        # inference tool-calling path never fell back to single-shot, ruling
+        # out the resilience change landed alongside the model swap. This
+        # markdown-only anchor (no repo/URL, evaluable_weight=40) is the
+        # noisiest of the three — see the 2026-06-05 history below; the model
+        # swap alone accounts for the jump. Tighten with a real repo+URL
         # fixture before all-India rollout to stabilise it (Phase 2 backlog).
-        expected_total=46.0,
+        # (2026-06-05 note, kept for history: was recalibrated 65.0 -> 46.0
+        # after sustained drift on claude-sonnet-4 across CI runs, observed
+        # 38.75-50.0, evaluable_weight=20 then. That LLM was replaced above.)
+        expected_total=65.0,
         description=(
             "Real agentic loop with LangGraph, structured outputs, evals, live "
             "deployment, honest limitations, clean build log, attribution. "
