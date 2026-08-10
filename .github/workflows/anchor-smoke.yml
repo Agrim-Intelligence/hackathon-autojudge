@@ -1,9 +1,12 @@
 name: anchor-smoke
 
 # Runs the three calibration anchors on PRs that touch agents, prompts, or
-# rubric config, and nightly so we catch model-side drift even when nobody
-# is editing the repo. The job fails when any anchor's total deviates from
-# its expected score by more than rubric/anchors.MAX_DRIFT.
+# rubric config. The job fails when any anchor's total deviates from its
+# expected score by more than rubric/anchors.MAX_DRIFT.
+#
+# The nightly cron schedule is disabled for now to stop spending Action
+# minutes on it — re-enable by uncommenting the `schedule:` block below when
+# needed again. workflow_dispatch below still allows an on-demand manual run.
 #
 # The job needs at least one LLM provider key. Defaults match the secrets
 # configured on the repo (Anthropic primary, Groq fallback). Override via
@@ -18,8 +21,8 @@ on:
       - "prompts/**"
       - "anchors/**"
       - ".github/workflows/anchor-smoke.yml"
-  schedule:
-    - cron: "0 19 * * *"   # 00:30 IST nightly
+  # schedule:
+  #   - cron: "0 19 * * *"   # 00:30 IST nightly — disabled to save Action minutes
   workflow_dispatch: {}
 
 jobs:
